@@ -1,0 +1,51 @@
+{
+  "name": "ledgerflow",
+  "version": "1.0.0",
+  "description": "Idempotent double-entry payment and webhook delivery engine",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/api/server.ts",
+    "worker:dev": "tsx watch src/worker/index.ts",
+    "build": "tsc && node -e \"fs.cpSync('src/db/migrations', 'dist/db/migrations', { recursive: true })\"",
+    "start": "node dist/api/server.js",
+    "worker:start": "node dist/worker/index.js",
+    "migrate": "tsx src/db/migrate.ts",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "ledger",
+    "double-entry",
+    "payments",
+    "idempotent",
+    "webhooks"
+  ],
+  "author": "LedgerFlow Team",
+  "license": "MIT",
+  "dependencies": {
+    "bullmq": "^5.41.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.2",
+    "morgan": "^1.10.0",
+    "pg": "^8.13.3",
+    "swagger-ui-express": "^5.0.1",
+    "uuid": "^11.1.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/morgan": "^1.9.9",
+    "@types/node": "^22.13.4",
+    "@types/pg": "^8.11.11",
+    "@types/supertest": "^6.0.2",
+    "@types/swagger-ui-express": "^4.1.7",
+    "@types/uuid": "^10.0.0",
+    "supertest": "^7.0.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
