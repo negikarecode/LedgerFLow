@@ -1,4 +1,6 @@
 import { Worker, Job, Queue } from 'bullmq';
+import { v4 as uuidv4 } from 'uuid';
+import { performance } from 'perf_hooks';
 import { getRedisClient } from '../redis/client';
 import { env } from '../config/env';
 import { getClient, query } from '../db/pool';
@@ -101,17 +103,29 @@ export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number
 }
 
 /**
- * Executes a single webhook HTTP dispatch, records outcome, and manages backoff/dead-lettering.
+ * Executes a single webhook HTTP dispatch, records outcome, writes to delivery_attempts log,
+ * and manages backoff/dead-lettering.
  */
 export async function processOutboxDelivery(
   data: WebhookDeliveryPayload
-): Promise<{ delivered: boolean; deadLetter?: boolean; error?: string }> {
-  const payloadString = JSON.stringify(data.payload);
+): Promise<{ delivered: boolean; deadLetter?: boolean; error?: string; attemptId?: string }> {
+  const startedAt = new Date();
+  const startTime = performance.now();
+  const deliveryId = uuidv4();
+
+  // Attach stable event_id and unique delivery_id to payload
+  const outgoingPayload = {
+    ...data.payload,
+    event_id: data.payload?.event_id || data.eventId,
+    delivery_id: deliveryId,
+  };
+  const payloadString = JSON.stringify(outgoingPayload);
   const signingSecret = data.secret || env.WEBHOOK_SECRET;
   const { signatureHeader } = signPayload(payloadString, signingSecret);
 
   let success = false;
-  let errorReason = '';
+  let httpStatus: number | null = null;
+  let errorMessage: string | null = null;
 
   try {
     const response = await dispatchSecureWebhook({
@@ -119,53 +133,90 @@ export async function processOutboxDelivery(
       payload: payloadString,
       headers: {
         'X-LedgerFlow-Signature': signatureHeader,
+        'X-LedgerFlow-Event-Id': data.eventId,
+        'X-LedgerFlow-Delivery-Id': deliveryId,
       },
       timeoutMs: 5000,
     });
 
+    httpStatus = response.statusCode;
+
     if (response.statusCode >= 200 && response.statusCode < 300) {
       success = true;
     } else {
-      errorReason = `HTTP ${response.statusCode} ${response.statusText}`;
+      errorMessage = (response.body || response.statusText || `HTTP ${response.statusCode}`).slice(0, 1024);
     }
   } catch (err: any) {
-    errorReason = err.message || 'Network request failed';
+    httpStatus = null;
+    errorMessage = (err.message || 'Network request failed').slice(0, 1024);
   }
+
+  const durationMs = Math.round(performance.now() - startTime);
+  const nextAttempts = data.attempts + 1;
+  let nextRetryAt: Date | null = null;
+  let deadLetter = false;
 
   if (success) {
     // Mark DELIVERED
     await query(
       `UPDATE outbox_events 
-       SET status = 'DELIVERED', next_retry_at = NULL 
+       SET status = 'DELIVERED', attempts = $2, next_retry_at = NULL 
        WHERE id = $1`,
-      [data.eventId]
+      [data.eventId, nextAttempts]
     );
-    return { delivered: true };
   } else {
-    // Increment attempts and compute exponential backoff
-    const nextAttempts = data.attempts + 1;
-
     if (nextAttempts >= 5) {
       // Reached max retries -> DEAD_LETTER
+      deadLetter = true;
       await query(
         `UPDATE outbox_events 
          SET status = 'DEAD_LETTER', attempts = $2, next_retry_at = NULL 
          WHERE id = $1`,
         [data.eventId, nextAttempts]
       );
-      return { delivered: false, deadLetter: true, error: errorReason };
     } else {
-      // Backoff: 2^attempts + jitter
+      // Exponential backoff: 2^attempts + jitter
       const backoffSeconds = Math.pow(2, nextAttempts) + Math.random() * 0.5;
-      await query(
+      const retryRes = await query(
         `UPDATE outbox_events 
          SET attempts = $2, next_retry_at = NOW() + ($3 || ' seconds')::INTERVAL 
-         WHERE id = $1`,
+         WHERE id = $1
+         RETURNING next_retry_at`,
         [data.eventId, nextAttempts, `${backoffSeconds}`]
       );
-      return { delivered: false, deadLetter: false, error: errorReason };
+      nextRetryAt = retryRes.rows[0]?.next_retry_at || null;
     }
   }
+
+  // Record delivery attempt in delivery_attempts table
+  try {
+    await query(
+      `INSERT INTO delivery_attempts (
+        id, outbox_event_id, attempt_number, started_at, duration_ms,
+        http_status, error_message, request_signature, next_retry_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        deliveryId,
+        data.eventId,
+        nextAttempts,
+        startedAt,
+        durationMs,
+        httpStatus,
+        errorMessage,
+        signatureHeader,
+        nextRetryAt,
+      ]
+    );
+  } catch (recordErr: any) {
+    console.warn('[Webhook Worker] Failed to write delivery attempt row:', recordErr.message);
+  }
+
+  return {
+    delivered: success,
+    deadLetter,
+    error: errorMessage || undefined,
+    attemptId: deliveryId,
+  };
 }
 
 /**

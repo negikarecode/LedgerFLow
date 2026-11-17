@@ -129,6 +129,13 @@ export async function handleMerchantWebhook(
       id: uuidv4(),
       payload: req.body,
       signature: signatureHeader,
+      headers: {
+        'x-ledgerflow-signature': signatureHeader,
+        'x-ledgerflow-event-id':
+          req.header('x-ledgerflow-event-id') || (req.headers['x-ledgerflow-event-id'] as string),
+        'x-ledgerflow-delivery-id':
+          req.header('x-ledgerflow-delivery-id') || (req.headers['x-ledgerflow-delivery-id'] as string),
+      },
       received_at: new Date().toISOString(),
     };
     await addReceivedEvent(eventRecord);

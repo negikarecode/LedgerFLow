@@ -446,19 +446,19 @@ export const openApiSpec = {
       get: {
         tags: ['Outbox'],
         summary: 'List transactional outbox events',
-        description: 'Lists recent webhook delivery events recorded in the transactional outbox scoped to the authenticated merchant.',
+        description: 'Lists recent webhook delivery events recorded in the transactional outbox scoped to the authenticated merchant with filtering and cursor pagination.',
         security: [{ ApiKeyAuth: [] }],
         parameters: [
           {
             name: 'limit',
             in: 'query',
-            description: 'Number of events to return (max 100)',
-            schema: { type: 'integer', default: 50 },
+            description: 'Number of events to return (1-100, default 20)',
+            schema: { type: 'integer', default: 20 },
           },
           {
             name: 'offset',
             in: 'query',
-            description: 'Number of events to skip',
+            description: 'Number of events to skip (offset pagination)',
             schema: { type: 'integer', default: 0 },
           },
           {
@@ -469,6 +469,30 @@ export const openApiSpec = {
               type: 'string',
               enum: ['PENDING', 'DELIVERED', 'DEAD_LETTER'],
             },
+          },
+          {
+            name: 'endpoint_id',
+            in: 'query',
+            description: 'Filter by webhook endpoint UUID',
+            schema: { type: 'string', format: 'uuid' },
+          },
+          {
+            name: 'start_date',
+            in: 'query',
+            description: 'Filter events created on or after ISO date-time',
+            schema: { type: 'string', format: 'date-time' },
+          },
+          {
+            name: 'end_date',
+            in: 'query',
+            description: 'Filter events created on or before ISO date-time',
+            schema: { type: 'string', format: 'date-time' },
+          },
+          {
+            name: 'cursor',
+            in: 'query',
+            description: 'Base64url encoded cursor for cursor-based pagination',
+            schema: { type: 'string' },
           },
         ],
         responses: {
@@ -485,11 +509,102 @@ export const openApiSpec = {
         },
       },
     },
+    '/outbox/replay-batch': {
+      post: {
+        tags: ['Outbox'],
+        summary: 'Batch replay dead-lettered events for an endpoint',
+        description: 'Finds all DEAD_LETTER outbox events belonging to the authenticated merchant for the specified endpoint_id, resets them to PENDING with attempts set to 0, and enqueues them for immediate delivery.',
+        security: [{ ApiKeyAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['endpoint_id'],
+                properties: {
+                  endpoint_id: {
+                    type: 'string',
+                    format: 'uuid',
+                    description: 'UUID of the webhook endpoint whose DEAD_LETTER events should be replayed',
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'Batch replay initiated successfully',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/BatchReplayResponse',
+                },
+              },
+            },
+          },
+          '400': {
+            description: 'Missing or invalid endpoint_id',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorResponse' },
+              },
+            },
+          },
+          '404': {
+            description: 'Webhook endpoint not found',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorResponse' },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/outbox/{id}': {
+      get: {
+        tags: ['Outbox'],
+        summary: 'Get outbox event with delivery attempt history',
+        description: 'Retrieves a single outbox event and its full chronological delivery attempts including durations, HTTP statuses, and error snippets.',
+        security: [{ ApiKeyAuth: [] }],
+        parameters: [
+          {
+            name: 'id',
+            in: 'path',
+            required: true,
+            description: 'UUID of the outbox event',
+            schema: { type: 'string', format: 'uuid' },
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'Outbox event details and attempt history retrieved successfully',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/OutboxEventDetail',
+                },
+              },
+            },
+          },
+          '404': {
+            description: 'Outbox event not found',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorResponse' },
+              },
+            },
+          },
+        },
+      },
+    },
     '/outbox/{id}/replay': {
       post: {
         tags: ['Outbox'],
-        summary: 'Replay dead-lettered outbox event',
-        description: 'Resets a DEAD_LETTER outbox event back to PENDING with attempts reset to 0 for redelivery.',
+        summary: 'Replay outbox event',
+        description: 'Resets a DEAD_LETTER or DELIVERED outbox event back to PENDING with attempts reset to 0 for redelivery, enqueuing it immediately while preserving full attempt history. Reuses stable event_id in payload so receivers can deduplicate. Rejects PENDING events with 400.',
         security: [{ ApiKeyAuth: [] }],
         parameters: [
           {
@@ -512,6 +627,14 @@ export const openApiSpec = {
                     event: { $ref: '#/components/schemas/OutboxEvent' },
                   },
                 },
+              },
+            },
+          },
+          '400': {
+            description: 'Event is currently PENDING delivery',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorResponse' },
               },
             },
           },
@@ -856,6 +979,8 @@ export const openApiSpec = {
         type: 'object',
         properties: {
           id: { type: 'string', format: 'uuid' },
+          merchant_id: { type: 'string', format: 'uuid' },
+          endpoint_id: { type: 'string', format: 'uuid', nullable: true },
           event_type: { type: 'string', example: 'transfer.completed' },
           payload: { type: 'object' },
           target_url: { type: 'string', format: 'uri' },
@@ -866,6 +991,50 @@ export const openApiSpec = {
           attempts: { type: 'integer' },
           next_retry_at: { type: 'string', format: 'date-time', nullable: true },
           created_at: { type: 'string', format: 'date-time' },
+        },
+      },
+      DeliveryAttempt: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', format: 'uuid' },
+          outbox_event_id: { type: 'string', format: 'uuid' },
+          attempt_number: { type: 'integer' },
+          started_at: { type: 'string', format: 'date-time' },
+          duration_ms: { type: 'integer' },
+          http_status: { type: 'integer', nullable: true },
+          error_message: {
+            type: 'string',
+            nullable: true,
+            description: 'Truncated error response body or network error snippet capped at 1KB',
+          },
+          request_signature: { type: 'string', nullable: true },
+          next_retry_at: { type: 'string', format: 'date-time', nullable: true },
+          created_at: { type: 'string', format: 'date-time' },
+        },
+      },
+      OutboxEventDetail: {
+        allOf: [
+          { $ref: '#/components/schemas/OutboxEvent' },
+          {
+            type: 'object',
+            properties: {
+              delivery_attempts: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/DeliveryAttempt' },
+              },
+            },
+          },
+        ],
+      },
+      BatchReplayResponse: {
+        type: 'object',
+        properties: {
+          message: { type: 'string' },
+          replayed_count: { type: 'integer' },
+          event_ids: {
+            type: 'array',
+            items: { type: 'string', format: 'uuid' },
+          },
         },
       },
       OutboxListResponse: {
@@ -881,6 +1050,7 @@ export const openApiSpec = {
               total: { type: 'integer' },
               limit: { type: 'integer' },
               offset: { type: 'integer' },
+              next_cursor: { type: 'string', nullable: true },
             },
           },
         },

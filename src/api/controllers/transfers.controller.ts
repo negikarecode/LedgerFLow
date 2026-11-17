@@ -148,24 +148,27 @@ export async function createTransfer(
     `;
     const endpointResult = await client.query(endpointQuery, [merchantId]);
 
-    const outboxPayload = {
-      event: 'transfer.completed',
-      transaction_id: transactionId,
-      from_account_id,
-      to_account_id,
-      amount_paise,
-      created_at: createdAt,
-    };
-
     const outboxEventIds: string[] = [];
 
     for (const ep of endpointResult.rows) {
+      const eventId = uuidv4();
+      const outboxPayload = {
+        event_id: eventId,
+        event: 'transfer.completed',
+        transaction_id: transactionId,
+        from_account_id,
+        to_account_id,
+        amount_paise,
+        created_at: createdAt,
+      };
+
       const outboxInsertQuery = `
-        INSERT INTO outbox_events (event_type, payload, target_url, status, merchant_id, endpoint_id)
-        VALUES ($1, $2, $3, 'PENDING', $4, $5)
+        INSERT INTO outbox_events (id, event_type, payload, target_url, status, merchant_id, endpoint_id)
+        VALUES ($1, $2, $3, $4, 'PENDING', $5, $6)
         RETURNING id;
       `;
       const outboxResult = await client.query(outboxInsertQuery, [
+        eventId,
         'transfer.completed',
         JSON.stringify(outboxPayload),
         ep.url,

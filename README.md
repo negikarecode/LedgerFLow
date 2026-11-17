@@ -6,7 +6,7 @@
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/features/actions)
-[![Tests](https://img.shields.io/badge/Tests-73%2F73%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Tests-82%2F82%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **LedgerFlow** is an enterprise-grade, multi-tenant, idempotent double-entry financial ledger and webhook delivery engine that guarantees strict balance conservation (0 paise lost or created), zero-overdraft concurrency control, cryptographic API-key multi-tenancy, and at-least-once signed webhook dispatch with automatic crash recovery.
@@ -22,10 +22,10 @@ flowchart LR
     Client["Client / Chaos UI<br/>(Bearer API Key Auth)"]
     API["Express API Server<br/>(Zod Validation + Scoped Idempotency)"]
     Redis[("Redis 7<br/>• Namespaced Mutex (NX)<br/>• Fast Replay Cache<br/>• BullMQ Work Queue")]
-    Postgres[("PostgreSQL 16<br/>• merchants & api_keys<br/>• accounts (tenant-scoped)<br/>• ledger_entries (Immutable)<br/>• webhook_endpoints<br/>• outbox_events")]
+    Postgres[("PostgreSQL 16<br/>• merchants & api_keys<br/>• accounts (tenant-scoped)<br/>• ledger_entries (Immutable)<br/>• webhook_endpoints<br/>• outbox_events & delivery_attempts")]
     Worker["Outbox Worker<br/>(BullMQ Consumer + Exponential Backoff)"]
     SSRF["SSRF Defense Engine<br/>• DNS Rebinding Pinning<br/>• Private & Metadata Filter<br/>• Hop-by-Hop Redirect Check"]
-    Merchant["Registered Webhook Receivers<br/>(Stripe-Style HMAC t=...,v1=...)"]
+    Merchant["Registered Webhook Receivers<br/>(Stripe-Style HMAC t=...,v1=...<br/>Dedupe: X-LedgerFlow-Event-Id)"]
 
     Client -->|1. POST /transfers (Idempotency-Key)| API
     API -->|2. SET idemp:merchant:key LOCKED NX| Redis
@@ -34,8 +34,8 @@ flowchart LR
     Worker -->|5. Sweep PENDING events into BullMQ| Postgres
     Worker -->|6. Process job with retry backoff| Redis
     Worker -->|7. Validate & pin target IP| SSRF
-    SSRF -->|8. POST payload + HMAC signature| Merchant
-    Worker -->|9. Mark event DELIVERED / DEAD_LETTER| Postgres
+    SSRF -->|8. POST payload + HMAC signature (event_id, delivery_id)| Merchant
+    Worker -->|9. Record delivery_attempt & mark DELIVERED / DEAD_LETTER| Postgres
 ```
 
 ---
@@ -168,7 +168,7 @@ npm run benchmark
 └─────────┴────────────────────────────────┴──────────────────────────────┘
 ```
 
-### 2. Comprehensive Test Suite (73/73 Passing)
+### 2. Comprehensive Test Suite (82/82 Passing)
 LedgerFlow includes extensive automated integration, concurrency, security, and unit tests using **Vitest** and **Supertest**:
 
 ```bash
@@ -176,6 +176,16 @@ npm test
 ```
 
 ```
+ ✓ tests/delivery-attempts.test.ts (9 tests)
+   ✓ Audit Logging: records HTTP 500 status & response snippet in delivery_attempts
+   ✓ Network Errors: records ECONNREFUSED with null status and error message
+   ✓ Socket Timeouts: records timeout failures with duration_ms and null status
+   ✓ Recovery Pipeline: dead-lettered event replay recovers to DELIVERED with full attempt history
+   ✓ State Guard: rejects replay requests on PENDING events (400 Bad Request)
+   ✓ Multi-Tenant Isolation: foreign tenant outbox view and replay returns 404 (not 403)
+   ✓ Filtering & Cursor Pagination: filters by status and supports base64url cursor pagination
+   ✓ Batch Replay: resets all DEAD_LETTER events for an endpoint in one call
+   ✓ Stable Identifiers: verifies stable event_id and unique delivery_id in headers & body
  ✓ tests/idempotency.test.ts (9 tests)
    ✓ Request Fingerprinting: SHA-256 (method + path + canonicalized body) with recursive key sorting
    ✓ Key Reuse Guard: returns 422 IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD on parameter mismatch
@@ -206,9 +216,9 @@ npm test
    ✓ Race-Condition Stress: 50 concurrent transfers; zero overdraft guarantee
    ✓ Deadlock Prevention: opposite-direction transfers (A->B and B->A); zero PostgreSQL deadlocks
 
- Test Files  6 passed (6)
-      Tests  73 passed (73)
-   Duration  8.29s
+ Test Files  7 passed (7)
+      Tests  82 passed (82)
+   Duration  9.15s
 ```
 
 ---
@@ -277,6 +287,19 @@ Webhooks dispatched to arbitrary partner URLs present severe Server-Side Request
   - Headers contain `X-LedgerFlow-Signature: t=<unix_timestamp>,v1=<hmac_sha256>`.
   - Receivers verify HMAC over `${t}.${payload}` and reject timestamps older than tolerance (e.g. 300s) to completely defeat replay attacks.
 
+### 6. Delivery Attempt Audit Log & Receiver Deduplication (`event_id` / `delivery_id`)
+Reliable webhook integration requires full visibility into delivery failures and safe replay semantics:
+- **Granular Attempt Audit Trail (`delivery_attempts` table):**
+  - Every individual HTTP dispatch logs an immutable row: `outbox_event_id`, `attempt_number`, `started_at`, execution `duration_ms`, `http_status` (or `null` on network errors/timeouts), `request_signature`, `next_retry_at`, and an `error_message` snippet capped at 1 KB.
+- **Receiver Deduplication via Stable Identifiers:**
+  - **`event_id` (Payload + `X-LedgerFlow-Event-Id` header):** Stable UUID generated at transfer commit time. Persists across all retry attempts and manual replays, enabling partner receivers to implement idempotent webhook processing with zero deduplication ambiguity.
+  - **`delivery_id` (Payload + `X-LedgerFlow-Delivery-Id` header):** Fresh UUID generated per HTTP dispatch attempt for end-to-end distributed tracing.
+- **Single & Batch Manual Replay:**
+  - **`POST /outbox/:id/replay`:** Allows manual replay of any `DEAD_LETTER` or `DELIVERED` event. Resets status to `PENDING` with `attempts = 0` and enqueues immediately into BullMQ, while strictly preserving all prior `delivery_attempts` history. Rejects active `PENDING` events (HTTP 400).
+  - **`POST /outbox/replay-batch`:** Replays all dead-lettered events for a specific endpoint in one operation.
+- **Visual Mission Control:**
+  - Interactive dashboard includes a live **Delivery Log** panel displaying attempt timelines, durations, HTTP response codes, error body snippets, and 1-click single or batch replay buttons.
+
 ---
 
 ## API Reference
@@ -296,10 +319,13 @@ Interactive OpenAPI 3.0 documentation is available at [http://localhost:3000/doc
 | `POST` | `/webhook-endpoints` | Register new webhook endpoint (SSRF validated) | Header: `Authorization: Bearer <api_key>`<br/>Body: `{ url, event_types, status }` |
 | `DELETE`| `/webhook-endpoints/:id` | Delete registered webhook endpoint | Header: `Authorization: Bearer <api_key>` |
 | `POST` | `/webhook-endpoints/:id/rotate-secret` | Rotate webhook signing secret | Header: `Authorization: Bearer <api_key>` |
-| `GET` | `/outbox` | View outbox events scoped to merchant | Header: `Authorization: Bearer <api_key>`<br/>Query: `?status=PENDING\|DELIVERED\|DEAD_LETTER` |
-| `POST` | `/outbox/:id/replay` | Reset dead-letter event for immediate redelivery | Header: `Authorization: Bearer <api_key>` |
+| `GET` | `/outbox` | View outbox events (filters: status, endpoint, date, cursor) | Header: `Authorization: Bearer <api_key>`<br/>Query: `status`, `endpoint_id`, `start_date`, `end_date`, `cursor`, `limit` |
+| `GET` | `/outbox/:id` | Get outbox event with full delivery attempts history | Header: `Authorization: Bearer <api_key>` |
+| `POST` | `/outbox/:id/replay` | Reset dead-letter or delivered event for immediate redelivery | Header: `Authorization: Bearer <api_key>` |
+| `POST` | `/outbox/replay-batch` | Batch replay all dead-lettered events for an endpoint | Header: `Authorization: Bearer <api_key>`<br/>Body: `{ endpoint_id }` |
 | `GET` | `/mock-merchant/status`| View status and verified HMAC payloads received | — (Public demo tool) |
 | `POST` | `/mock-merchant/crash` | Toggle mock merchant crash mode | `{ "crash": true \| false }` |
+| `POST` | `/mock-merchant/reset` | Truncate ledger/outbox and re-seed Alice & Bob demo wallets | — (Public demo tool) |
 
 ---
 
@@ -313,7 +339,7 @@ LedgerFlow includes an automated CI pipeline defined in [`.github/workflows/ci.y
   2. `tsc --noEmit` (strict TypeScript type verification)
   3. `npm run migrate` (applies schema migrations)
   4. `npm run build` (builds production artifacts)
-  5. `npm test` (executes 73 Vitest integration test cases)
+  5. `npm test` (executes 82 Vitest integration test cases)
 
 ---
 
