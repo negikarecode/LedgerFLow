@@ -6,7 +6,7 @@
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/features/actions)
-[![Tests](https://img.shields.io/badge/Tests-82%2F82%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Tests-88%2F88%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **LedgerFlow** is an enterprise-grade, multi-tenant, idempotent double-entry financial ledger and webhook delivery engine that guarantees strict balance conservation (0 paise lost or created), zero-overdraft concurrency control, cryptographic API-key multi-tenancy, and at-least-once signed webhook dispatch with automatic crash recovery.
@@ -21,9 +21,9 @@ LedgerFlow decouples synchronous money movement from asynchronous partner notifi
 flowchart LR
     Client["Client / Chaos UI<br/>(Bearer API Key Auth)"]
     API["Express API Server<br/>(Zod Validation + Scoped Idempotency)"]
-    Redis[("Redis 7<br/>• Namespaced Mutex (NX)<br/>• Fast Replay Cache<br/>• BullMQ Work Queue")]
-    Postgres[("PostgreSQL 16<br/>• merchants & api_keys<br/>• accounts (tenant-scoped)<br/>• ledger_entries (Immutable)<br/>• webhook_endpoints<br/>• outbox_events & delivery_attempts")]
-    Worker["Outbox Worker<br/>(BullMQ Consumer + Exponential Backoff)"]
+    Redis[("Redis 7<br/>• Namespaced Mutex (NX)<br/>• Fast Replay Cache<br/>• BullMQ Work Queue<br/>• Circuit Breaker (CLOSED/OPEN/HALF_OPEN)<br/>• Token Bucket Rate Limiter (Lua)")]
+    Postgres[("PostgreSQL 16<br/>• merchants & api_keys<br/>• accounts (tenant-scoped)<br/>• ledger_entries (Immutable)<br/>• webhook_endpoints & cb_state<br/>• outbox_events & delivery_attempts")]
+    Worker["Outbox Worker<br/>(BullMQ Consumer + Concurrency Guard + Fair Poller)"]
     SSRF["SSRF Defense Engine<br/>• DNS Rebinding Pinning<br/>• Private & Metadata Filter<br/>• Hop-by-Hop Redirect Check"]
     Merchant["Registered Webhook Receivers<br/>(Stripe-Style HMAC t=...,v1=...<br/>Dedupe: X-LedgerFlow-Event-Id)"]
 
@@ -31,11 +31,11 @@ flowchart LR
     API -->|2. SET idemp:merchant:key LOCKED NX| Redis
     API -->|3. ACID Tx: Lock Accounts, Entries, Fan-out Outbox| Postgres
     API -->|4. Release lock & Cache response| Redis
-    Worker -->|5. Sweep PENDING events into BullMQ| Postgres
-    Worker -->|6. Process job with retry backoff| Redis
-    Worker -->|7. Validate & pin target IP| SSRF
+    Worker -->|5. Sweep PENDING events (fair partition)| Postgres
+    Worker -->|6. Process job: Check Circuit Breaker & Rate Limit| Redis
+    Worker -->|7. Validate & pin target IP (hard timeout)| SSRF
     SSRF -->|8. POST payload + HMAC signature (event_id, delivery_id)| Merchant
-    Worker -->|9. Record delivery_attempt & mark DELIVERED / DEAD_LETTER| Postgres
+    Worker -->|9. Record delivery_attempt & update breaker state| Postgres
 ```
 
 ---
@@ -168,7 +168,7 @@ npm run benchmark
 └─────────┴────────────────────────────────┴──────────────────────────────┘
 ```
 
-### 2. Comprehensive Test Suite (82/82 Passing)
+### 2. Comprehensive Test Suite (88/88 Passing)
 LedgerFlow includes extensive automated integration, concurrency, security, and unit tests using **Vitest** and **Supertest**:
 
 ```bash
@@ -176,6 +176,13 @@ npm test
 ```
 
 ```
+ ✓ tests/circuit-breaker.test.ts (6 tests)
+   ✓ Failure Isolation: Endpoint A failing 10 times trips breaker while Endpoint B keeps delivering
+   ✓ Probe Recovery: Circuit breaker recovers to CLOSED via single HALF_OPEN probe upon endpoint recovery
+   ✓ Probe Protection: Failed probe in HALF_OPEN immediately re-trips breaker to OPEN
+   ✓ Token Bucket Rate Limiting: Lua token bucket in Redis caps deliveries and delays excess without dropping
+   ✓ State Inspection: Exposes real-time circuit breaker status & cooldown in GET /webhook-endpoints/:id
+   ✓ Storage Resilience: Falls back safely to PostgreSQL if Redis is degraded or unavailable
  ✓ tests/delivery-attempts.test.ts (9 tests)
    ✓ Audit Logging: records HTTP 500 status & response snippet in delivery_attempts
    ✓ Network Errors: records ECONNREFUSED with null status and error message
@@ -216,9 +223,9 @@ npm test
    ✓ Race-Condition Stress: 50 concurrent transfers; zero overdraft guarantee
    ✓ Deadlock Prevention: opposite-direction transfers (A->B and B->A); zero PostgreSQL deadlocks
 
- Test Files  7 passed (7)
-      Tests  82 passed (82)
-   Duration  9.15s
+ Test Files  8 passed (8)
+      Tests  88 passed (88)
+   Duration  28.27s
 ```
 
 ---
@@ -300,6 +307,24 @@ Reliable webhook integration requires full visibility into delivery failures and
 - **Visual Mission Control:**
   - Interactive dashboard includes a live **Delivery Log** panel displaying attempt timelines, durations, HTTP response codes, error body snippets, and 1-click single or batch replay buttons.
 
+### 7. Per-Endpoint Isolation, Distributed Circuit Breaker & Rate Limiter
+A single failing, slow, or malicious merchant endpoint must never degrade performance or monopolize worker queues for healthy partners:
+- **Per-Endpoint Distributed Circuit Breaker (`CLOSED` / `OPEN` / `HALF_OPEN`):**
+  - **Shared Redis State with Durable PostgreSQL Fallback:** Tracks real-time failure state across horizontally scaled workers (`cb:endpoint:<id>`), falling back to PostgreSQL `webhook_endpoints` if Redis is degraded.
+  - **Automatic Tripping:** Trips to `OPEN` after 10 consecutive failures or >50% rolling window error rate.
+  - **Non-Blocking Reschedule (Zero Wasted Attempts):** While `OPEN`, jobs for that endpoint are fast-rescheduled with delay in <1ms without hitting the network and without incrementing attempts (`outbox_events.attempts` remains untouched).
+  - **Single Probe in `HALF_OPEN`:** After cooldown (default 30s), transitions to `HALF_OPEN` and permits exactly one probe request via atomic Redis `SET ... NX`. Probe success closes the breaker; probe failure re-trips it immediately to `OPEN`.
+- **Token Bucket Rate Limiting (Redis Lua):**
+  - Token bucket algorithm implemented as an atomic Lua script in Redis.
+  - Configurable deliveries/second (default 10) and burst capacity (default 20).
+  - Excess deliveries are scheduled with delay (`wait_ms`), **never dropped**.
+- **Queue Starvation & Concurrency Guard:**
+  - **Hard Delivery Timeout:** 5000ms hard timeout on every HTTP dispatch.
+  - **In-Flight Concurrency Limit:** Max concurrent dispatches per endpoint (default 3) prevents any single endpoint from consuming all worker threads.
+  - **Fair Outbox Polling:** Outbox poller uses SQL window partitioning (`ROW_NUMBER() OVER (PARTITION BY endpoint_id)`) to interleave events across endpoints so high-volume or dead merchants cannot starve others.
+- **Before/After Verification:**
+  - Run `npm run demo:isolation` to execute the automated before/after demonstration comparing queue behavior and zero worker starvation.
+
 ---
 
 ## API Reference
@@ -315,8 +340,9 @@ Interactive OpenAPI 3.0 documentation is available at [http://localhost:3000/doc
 | `GET` | `/accounts/:id` | Get account details & recent ledger entries | Header: `Authorization: Bearer <api_key>` |
 | `GET` | `/accounts/:id/ledger`| Get calculated balance & entry statement | Header: `Authorization: Bearer <api_key>` |
 | `POST` | `/transfers` | Atomic transfer; enqueues outbox events to registered endpoints | Headers: `Authorization: Bearer <api_key>`, `Idempotency-Key`<br/>Body: `{ from_account_id, to_account_id, amount_paise }` |
-| `GET` | `/webhook-endpoints` | List registered webhook endpoints for tenant | Header: `Authorization: Bearer <api_key>` |
+| `GET` | `/webhook-endpoints` | List registered webhook endpoints with circuit breaker state | Header: `Authorization: Bearer <api_key>` |
 | `POST` | `/webhook-endpoints` | Register new webhook endpoint (SSRF validated) | Header: `Authorization: Bearer <api_key>`<br/>Body: `{ url, event_types, status }` |
+| `GET` | `/webhook-endpoints/:id` | Get endpoint with live circuit breaker status & rate limits | Header: `Authorization: Bearer <api_key>` |
 | `DELETE`| `/webhook-endpoints/:id` | Delete registered webhook endpoint | Header: `Authorization: Bearer <api_key>` |
 | `POST` | `/webhook-endpoints/:id/rotate-secret` | Rotate webhook signing secret | Header: `Authorization: Bearer <api_key>` |
 | `GET` | `/outbox` | View outbox events (filters: status, endpoint, date, cursor) | Header: `Authorization: Bearer <api_key>`<br/>Query: `status`, `endpoint_id`, `start_date`, `end_date`, `cursor`, `limit` |
@@ -339,7 +365,7 @@ LedgerFlow includes an automated CI pipeline defined in [`.github/workflows/ci.y
   2. `tsc --noEmit` (strict TypeScript type verification)
   3. `npm run migrate` (applies schema migrations)
   4. `npm run build` (builds production artifacts)
-  5. `npm test` (executes 82 Vitest integration test cases)
+  5. `npm test` (executes 88 Vitest integration test cases)
 
 ---
 

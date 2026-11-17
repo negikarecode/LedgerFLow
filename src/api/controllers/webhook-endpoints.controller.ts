@@ -3,6 +3,8 @@ import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../../db/pool';
 import { validateWebhookUrl, SSRFError } from '../../security/ssrf';
+import { circuitBreaker } from '../../worker/circuit-breaker';
+import { rateLimiter } from '../../worker/rate-limiter';
 
 const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
 
@@ -80,7 +82,7 @@ export async function createWebhookEndpoint(
 
 /**
  * GET /webhook-endpoints
- * Lists all webhook endpoints for the authenticated merchant with masked secrets.
+ * Lists all webhook endpoints for the authenticated merchant with masked secrets and circuit breaker states.
  */
 export async function listWebhookEndpoints(
   req: Request,
@@ -91,23 +93,87 @@ export async function listWebhookEndpoints(
 
   try {
     const result = await query(
-      `SELECT id, merchant_id, url, secret, event_types, status, created_at
+      `SELECT id, merchant_id, url, secret, event_types, status,
+              rate_limit_per_second, rate_limit_burst, created_at
        FROM webhook_endpoints
        WHERE merchant_id = $1
        ORDER BY created_at DESC`,
       [merchantId]
     );
 
+    const data = await Promise.all(
+      result.rows.map(async (row) => {
+        const cbStatus = await circuitBreaker.getStatus(row.id);
+        const rlSettings = rateLimiter.getSettings(
+          row.rate_limit_per_second,
+          row.rate_limit_burst
+        );
+        return {
+          id: row.id,
+          merchant_id: row.merchant_id,
+          url: row.url,
+          secret: maskSecret(row.secret),
+          event_types: row.event_types,
+          status: row.status,
+          circuit_breaker: cbStatus,
+          rate_limit: rlSettings,
+          created_at: row.created_at,
+        };
+      })
+    );
+
+    res.status(200).json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /webhook-endpoints/:id
+ * Retrieves a single webhook endpoint with current circuit breaker state and rate limits.
+ */
+export async function getWebhookEndpoint(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const { id } = req.params;
+  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+
+  try {
+    const result = await query(
+      `SELECT id, merchant_id, url, secret, event_types, status,
+              rate_limit_per_second, rate_limit_burst, created_at
+       FROM webhook_endpoints
+       WHERE id = $1 AND merchant_id = $2`,
+      [id, merchantId]
+    );
+
+    if (result.rows.length === 0) {
+      res.status(404).json({
+        error: 'Not Found',
+        message: `Webhook endpoint with ID '${id}' not found`,
+      });
+      return;
+    }
+
+    const row = result.rows[0];
+    const cbStatus = await circuitBreaker.getStatus(row.id);
+    const rlSettings = rateLimiter.getSettings(
+      row.rate_limit_per_second,
+      row.rate_limit_burst
+    );
+
     res.status(200).json({
-      data: result.rows.map((row) => ({
-        id: row.id,
-        merchant_id: row.merchant_id,
-        url: row.url,
-        secret: maskSecret(row.secret),
-        event_types: row.event_types,
-        status: row.status,
-        created_at: row.created_at,
-      })),
+      id: row.id,
+      merchant_id: row.merchant_id,
+      url: row.url,
+      secret: maskSecret(row.secret),
+      event_types: row.event_types,
+      status: row.status,
+      circuit_breaker: cbStatus,
+      rate_limit: rlSettings,
+      created_at: row.created_at,
     });
   } catch (err) {
     next(err);

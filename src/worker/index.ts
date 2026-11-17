@@ -7,6 +7,12 @@ import { getClient, query } from '../db/pool';
 import { signPayload } from './signature';
 import { dispatchSecureWebhook } from '../security/ssrf';
 import { cleanupExpiredIdempotencyKeys } from '../api/middlewares/idempotency';
+import { circuitBreaker, EndpointCircuitBreaker } from './circuit-breaker';
+import { rateLimiter, EndpointRateLimiter } from './rate-limiter';
+import { concurrencyLimiter, EndpointConcurrencyLimiter } from './concurrency-limiter';
+
+export { circuitBreaker, rateLimiter, concurrencyLimiter };
+export { EndpointCircuitBreaker, EndpointRateLimiter, EndpointConcurrencyLimiter };
 
 export interface WebhookDeliveryPayload {
   eventId: string;
@@ -16,6 +22,8 @@ export interface WebhookDeliveryPayload {
   attempts: number;
   secret?: string;
   endpointId?: string;
+  rateLimitPerSecond?: number;
+  rateLimitBurst?: number;
 }
 
 export const QUEUE_NAME = 'webhook-delivery';
@@ -32,8 +40,8 @@ export function getWebhookQueue(): Queue<WebhookDeliveryPayload> {
 }
 
 /**
- * Polls eligible PENDING outbox events using FOR UPDATE SKIP LOCKED
- * and enqueues them into BullMQ.
+ * Polls eligible PENDING outbox events using fair endpoint partitioning
+ * with FOR UPDATE SKIP LOCKED and enqueues them into BullMQ.
  */
 export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number> {
   const client = await getClient();
@@ -42,15 +50,28 @@ export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number
   try {
     await client.query('BEGIN');
 
+    // Interleave events across endpoints so a single dead or overloaded endpoint
+    // cannot monopolize the polled batch (starvation prevention).
     const selectQuery = `
+      WITH eligible AS (
+        SELECT o.id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY COALESCE(o.endpoint_id, '00000000-0000-0000-0000-000000000000'::UUID)
+                 ORDER BY o.created_at ASC
+               ) as ep_rank
+        FROM outbox_events o
+        WHERE o.status = 'PENDING'
+          AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
+        ORDER BY ep_rank ASC, o.created_at ASC
+        LIMIT $1
+      )
       SELECT o.id, o.event_type, o.target_url, o.payload, o.attempts, o.endpoint_id,
-             e.secret as endpoint_secret
+             e.secret as endpoint_secret,
+             e.rate_limit_per_second, e.rate_limit_burst
       FROM outbox_events o
+      JOIN eligible el ON o.id = el.id
       LEFT JOIN webhook_endpoints e ON e.id = o.endpoint_id
-      WHERE o.status = 'PENDING'
-        AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
-      ORDER BY o.created_at ASC
-      LIMIT $1
+      ORDER BY el.ep_rank ASC, o.created_at ASC
       FOR UPDATE OF o SKIP LOCKED;
     `;
     const result = await client.query(selectQuery, [batchSize]);
@@ -84,6 +105,8 @@ export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number
           attempts: Number(row.attempts),
           secret: row.endpoint_secret || env.WEBHOOK_SECRET,
           endpointId: row.endpoint_id,
+          rateLimitPerSecond: row.rate_limit_per_second,
+          rateLimitBurst: row.rate_limit_burst,
         },
         {
           jobId: `${row.id}-${row.attempts}-${Date.now()}`,
@@ -104,14 +127,92 @@ export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number
 
 /**
  * Executes a single webhook HTTP dispatch, records outcome, writes to delivery_attempts log,
- * and manages backoff/dead-lettering.
+ * and manages circuit breaker, token bucket rate limits, in-flight concurrency, and backoff.
  */
 export async function processOutboxDelivery(
   data: WebhookDeliveryPayload
-): Promise<{ delivered: boolean; deadLetter?: boolean; error?: string; attemptId?: string }> {
+): Promise<{
+  delivered: boolean;
+  deadLetter?: boolean;
+  error?: string;
+  attemptId?: string;
+  rescheduled?: boolean;
+  reason?: string;
+  delayMs?: number;
+}> {
   const startedAt = new Date();
   const startTime = performance.now();
   const deliveryId = uuidv4();
+
+  let isProbe = false;
+
+  // 1. Per-Endpoint Isolation Checks (Circuit Breaker, Rate Limit, In-Flight Concurrency)
+  if (data.endpointId) {
+    // 1a. Circuit Breaker Check
+    const cbCheck = await circuitBreaker.canAttemptDelivery(data.endpointId);
+    if (!cbCheck.allowed) {
+      const delayMs = cbCheck.delayMs || 5000;
+      console.log(
+        `[Webhook Worker] Circuit breaker is ${cbCheck.state} for endpoint ${data.endpointId}. Rescheduling event ${data.eventId} in ${delayMs}ms without burning attempt.`
+      );
+      await query(
+        `UPDATE outbox_events 
+         SET next_retry_at = NOW() + ($2 || ' milliseconds')::INTERVAL 
+         WHERE id = $1`,
+        [data.eventId, `${delayMs}`]
+      );
+      return {
+        delivered: false,
+        rescheduled: true,
+        reason: `CIRCUIT_BREAKER_${cbCheck.state}`,
+        delayMs,
+      };
+    }
+    isProbe = Boolean(cbCheck.isProbe);
+
+    // 1b. Token Bucket Rate Limit Check (Lua in Redis)
+    const rlCheck = await rateLimiter.consume(
+      data.endpointId,
+      data.rateLimitPerSecond,
+      data.rateLimitBurst
+    );
+    if (!rlCheck.allowed) {
+      const delayMs = rlCheck.waitMs;
+      console.log(
+        `[Webhook Worker] Rate limit reached for endpoint ${data.endpointId}. Rescheduling event ${data.eventId} in ${delayMs}ms without burning attempt.`
+      );
+      await query(
+        `UPDATE outbox_events 
+         SET next_retry_at = NOW() + ($2 || ' milliseconds')::INTERVAL 
+         WHERE id = $1`,
+        [data.eventId, `${delayMs}`]
+      );
+      return {
+        delivered: false,
+        rescheduled: true,
+        reason: 'RATE_LIMITED',
+        delayMs,
+      };
+    }
+
+    // 1c. In-Flight Concurrency Limiter (prevent slow endpoints from starving worker threads)
+    const concCheck = await concurrencyLimiter.acquire(data.endpointId);
+    if (!concCheck.allowed) {
+      const delayMs = 250;
+      await query(
+        `UPDATE outbox_events 
+         SET next_retry_at = NOW() + INTERVAL '250 milliseconds' 
+         WHERE id = $1`,
+        [data.eventId]
+      );
+      return {
+        delivered: false,
+        rescheduled: true,
+        reason: 'CONCURRENCY_LIMITED',
+        delayMs,
+      };
+    }
+  }
 
   // Attach stable event_id and unique delivery_id to payload
   const outgoingPayload = {
@@ -128,16 +229,28 @@ export async function processOutboxDelivery(
   let errorMessage: string | null = null;
 
   try {
-    const response = await dispatchSecureWebhook({
-      url: data.targetUrl,
-      payload: payloadString,
-      headers: {
-        'X-LedgerFlow-Signature': signatureHeader,
-        'X-LedgerFlow-Event-Id': data.eventId,
-        'X-LedgerFlow-Delivery-Id': deliveryId,
-      },
-      timeoutMs: 5000,
-    });
+    const hardTimeoutMs = env.WEBHOOK_DELIVERY_TIMEOUT_MS;
+    const timeoutPromise = new Promise<{ statusCode: number; statusText?: string; body?: string }>(
+      (_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Webhook dispatch timed out after ${hardTimeoutMs}ms`)),
+          hardTimeoutMs + 500
+        )
+    );
+
+    const response = await Promise.race([
+      dispatchSecureWebhook({
+        url: data.targetUrl,
+        payload: payloadString,
+        headers: {
+          'X-LedgerFlow-Signature': signatureHeader,
+          'X-LedgerFlow-Event-Id': data.eventId,
+          'X-LedgerFlow-Delivery-Id': deliveryId,
+        },
+        timeoutMs: hardTimeoutMs,
+      }),
+      timeoutPromise,
+    ]);
 
     httpStatus = response.statusCode;
 
@@ -149,9 +262,23 @@ export async function processOutboxDelivery(
   } catch (err: any) {
     httpStatus = null;
     errorMessage = (err.message || 'Network request failed').slice(0, 1024);
+  } finally {
+    if (data.endpointId) {
+      await concurrencyLimiter.release(data.endpointId);
+    }
   }
 
   const durationMs = Math.round(performance.now() - startTime);
+
+  // Update Circuit Breaker State based on dispatch outcome
+  if (data.endpointId) {
+    if (success) {
+      await circuitBreaker.recordSuccess(data.endpointId, isProbe);
+    } else {
+      await circuitBreaker.recordFailure(data.endpointId, isProbe);
+    }
+  }
+
   const nextAttempts = data.attempts + 1;
   let nextRetryAt: Date | null = null;
   let deadLetter = false;
@@ -240,12 +367,12 @@ export function startWebhookWorker(): {
     },
     {
       connection,
-      concurrency: 5,
+      concurrency: env.WEBHOOK_WORKER_CONCURRENCY,
     }
   );
 
   worker.on('ready', () => {
-    console.log(`[Webhook Worker] Listening for jobs on '${QUEUE_NAME}'...`);
+    console.log(`[Webhook Worker] Listening for jobs on '${QUEUE_NAME}' with concurrency ${env.WEBHOOK_WORKER_CONCURRENCY}...`);
   });
 
   worker.on('completed', (job: Job) => {

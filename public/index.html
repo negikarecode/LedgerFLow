@@ -100,6 +100,7 @@
       const [accountLedger, setAccountLedger] = useState(null);
       const [outboxEvents, setOutboxEvents] = useState([]);
       const [merchantStatus, setMerchantStatus] = useState({ crashMode: false, receivedEvents: [] });
+      const [endpointInfo, setEndpointInfo] = useState(null);
       const [loading, setLoading] = useState(false);
       const [toast, setToast] = useState(null);
 
@@ -211,8 +212,20 @@
         }
       };
 
+      const fetchEndpoints = async () => {
+        try {
+          const res = await fetch('/webhook-endpoints', { headers: authHeaders });
+          const data = await res.json();
+          if (data.data && data.data.length > 0) {
+            setEndpointInfo(data.data[0]);
+          }
+        } catch (e) {
+          console.error('Error fetching endpoints:', e);
+        }
+      };
+
       const refreshAll = async () => {
-        await Promise.all([fetchAccounts(), fetchOutbox(), fetchMerchant()]);
+        await Promise.all([fetchAccounts(), fetchOutbox(), fetchMerchant(), fetchEndpoints()]);
         if (selectedAccountId) fetchLedger(selectedAccountId);
       };
 
@@ -817,6 +830,27 @@
                     {merchantStatus.crashMode ? 'Recover Merchant' : 'Simulate Crash'}
                   </button>
                 </div>
+
+                {endpointInfo && endpointInfo.circuit_breaker && (
+                  <div className="flex items-center justify-between text-xs pt-2.5 mt-1 border-t border-slate-100 dark:border-[#27272a]/60">
+                    <span className="text-[11px] text-slate-500 dark:text-zinc-400">Circuit Breaker & Rate Limit</span>
+                    <div className="flex items-center space-x-1.5">
+                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                        endpointInfo.circuit_breaker.state === 'OPEN'
+                          ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-800/50'
+                          : endpointInfo.circuit_breaker.state === 'HALF_OPEN'
+                          ? 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800/50'
+                          : 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/50'
+                      }`}>
+                        {endpointInfo.circuit_breaker.state}
+                        {endpointInfo.circuit_breaker.state === 'OPEN' ? ` (${endpointInfo.circuit_breaker.cooldown_remaining_seconds}s)` : ''}
+                      </span>
+                      <span className="text-[10px] text-slate-400 dark:text-zinc-500 font-mono">
+                        {endpointInfo.rate_limit?.deliveries_per_second || 10}/s
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* 4. Collapsible "Create Wallet" Form */}

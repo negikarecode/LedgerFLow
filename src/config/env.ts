@@ -22,6 +22,14 @@ const envSchema = z.object({
     .transform((val) => val === 'true'),
   IDEMPOTENCY_RETENTION_SECONDS: z.coerce.number().default(86400),
   IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS: z.coerce.number().default(3600),
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce.number().default(10),
+  CIRCUIT_BREAKER_COOLDOWN_SECONDS: z.coerce.number().default(30),
+  CIRCUIT_BREAKER_ERROR_RATE_THRESHOLD: z.coerce.number().default(0.5),
+  WEBHOOK_RATE_LIMIT_PER_SECOND: z.coerce.number().default(10),
+  WEBHOOK_RATE_LIMIT_BURST: z.coerce.number().default(20),
+  WEBHOOK_MAX_CONCURRENT_PER_ENDPOINT: z.coerce.number().default(3),
+  WEBHOOK_DELIVERY_TIMEOUT_MS: z.coerce.number().default(5000),
+  WEBHOOK_WORKER_CONCURRENCY: z.coerce.number().default(10),
 });
 
 export const env = envSchema.parse(process.env);

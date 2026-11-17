@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   createWebhookEndpoint,
   listWebhookEndpoints,
+  getWebhookEndpoint,
   deleteWebhookEndpoint,
   rotateWebhookEndpointSecret,
 } from '../controllers/webhook-endpoints.controller';
@@ -23,6 +24,13 @@ webhookEndpointsRouter.get(
   '/webhook-endpoints',
   requireApiKey,
   listWebhookEndpoints
+);
+
+webhookEndpointsRouter.get(
+  '/webhook-endpoints/:id',
+  requireApiKey,
+  validateParams(idParamSchema),
+  getWebhookEndpoint
 );
 
 webhookEndpointsRouter.delete(

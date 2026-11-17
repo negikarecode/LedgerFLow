@@ -89,9 +89,21 @@ export async function resetDemoState(
 
     // 5. Clear Redis cache and state
     try {
+      const keysToDel: string[] = [];
       const idempKeys = await redis.keys('idemp:*');
-      if (idempKeys.length > 0) {
-        await redis.del(...idempKeys);
+      if (idempKeys.length > 0) keysToDel.push(...idempKeys);
+
+      const cbKeys = await redis.keys('cb:*');
+      if (cbKeys.length > 0) keysToDel.push(...cbKeys);
+
+      const rlKeys = await redis.keys('ratelimit:*');
+      if (rlKeys.length > 0) keysToDel.push(...rlKeys);
+
+      const concKeys = await redis.keys('concurrency:*');
+      if (concKeys.length > 0) keysToDel.push(...concKeys);
+
+      if (keysToDel.length > 0) {
+        await redis.del(...keysToDel);
       }
       await redis.del('mock_merchant:events');
       await redis.set('mock_merchant:crash_mode', 'false');

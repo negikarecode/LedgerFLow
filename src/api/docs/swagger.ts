@@ -386,6 +386,41 @@ export const openApiSpec = {
       },
     },
     '/webhook-endpoints/{id}': {
+      get: {
+        tags: ['Webhook Endpoints'],
+        summary: 'Get webhook endpoint with circuit breaker and rate limit state',
+        description: 'Retrieves a single webhook endpoint with real-time circuit breaker status (CLOSED/OPEN/HALF_OPEN, consecutive failures, cooldown remaining) and token bucket rate limits.',
+        security: [{ ApiKeyAuth: [] }],
+        parameters: [
+          {
+            name: 'id',
+            in: 'path',
+            required: true,
+            description: 'UUID of the webhook endpoint',
+            schema: { type: 'string', format: 'uuid' },
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'Webhook endpoint details retrieved successfully',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/WebhookEndpoint',
+                },
+              },
+            },
+          },
+          '404': {
+            description: 'Webhook endpoint not found',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorResponse' },
+              },
+            },
+          },
+        },
+      },
       delete: {
         tags: ['Webhook Endpoints'],
         summary: 'Delete webhook endpoint',
@@ -924,6 +959,23 @@ export const openApiSpec = {
           },
         },
       },
+      CircuitBreakerStatus: {
+        type: 'object',
+        properties: {
+          state: { type: 'string', enum: ['CLOSED', 'OPEN', 'HALF_OPEN'] },
+          consecutive_failures: { type: 'integer' },
+          opened_at: { type: 'string', format: 'date-time', nullable: true },
+          last_failure_at: { type: 'string', format: 'date-time', nullable: true },
+          cooldown_remaining_seconds: { type: 'integer' },
+        },
+      },
+      RateLimitSettings: {
+        type: 'object',
+        properties: {
+          deliveries_per_second: { type: 'integer' },
+          burst: { type: 'integer' },
+        },
+      },
       WebhookEndpoint: {
         type: 'object',
         properties: {
@@ -933,6 +985,8 @@ export const openApiSpec = {
           secret: { type: 'string', example: 'whsec_a1b2...c3d4' },
           event_types: { type: 'array', items: { type: 'string' } },
           status: { type: 'string', enum: ['ACTIVE', 'DISABLED'] },
+          circuit_breaker: { $ref: '#/components/schemas/CircuitBreakerStatus' },
+          rate_limit: { $ref: '#/components/schemas/RateLimitSettings' },
           created_at: { type: 'string', format: 'date-time' },
         },
       },
