@@ -14,6 +14,12 @@ const envSchema = z.object({
   POSTGRES_PORT: z.coerce.number().optional().default(5432),
   REDIS_PORT: z.coerce.number().optional().default(6379),
   WEBHOOK_SECRET: z.string().default('default-ledgerflow-secret-key-12345'),
+  ADMIN_TOKEN: z.string().default('default-admin-token-secret-99999'),
+  ALLOW_PRIVATE_WEBHOOK_TARGETS: z
+    .string()
+    .optional()
+    .default('false')
+    .transform((val) => val === 'true'),
 });
 
 export const env = envSchema.parse(process.env);

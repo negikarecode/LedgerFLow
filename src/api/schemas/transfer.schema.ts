@@ -12,10 +12,6 @@ export const createTransferSchema = z
       .number({ required_error: 'amount_paise is required' })
       .int({ message: 'amount_paise must be an integer' })
       .positive({ message: 'amount_paise must be greater than 0' }),
-    webhook_url: z
-      .string()
-      .url({ message: 'webhook_url must be a valid URL' })
-      .optional(),
   })
   .refine((data) => data.from_account_id !== data.to_account_id, {
     message: 'from_account_id and to_account_id must not be the same',

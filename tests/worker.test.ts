@@ -185,8 +185,8 @@ describe('LedgerFlow Phase 3 - Webhook Worker & Mock Merchant Suite', () => {
 
       // 1. Insert outbox event at attempt 4
       await query(
-        `INSERT INTO outbox_events (id, event_type, payload, target_url, status, attempts)
-         VALUES ($1, 'transfer.completed', $2, $3, 'PENDING', 4)`,
+        `INSERT INTO outbox_events (id, merchant_id, event_type, payload, target_url, status, attempts)
+         VALUES ($1, '00000000-0000-0000-0000-000000000001', 'transfer.completed', $2, $3, 'PENDING', 4)`,
         [eventId, JSON.stringify(payload), targetUrl]
       );
 
@@ -214,7 +214,9 @@ describe('LedgerFlow Phase 3 - Webhook Worker & Mock Merchant Suite', () => {
       expect(Number(deadLetterCheck.rows[0].attempts)).toBe(5);
 
       // 4. Call POST /outbox/:id/replay to reset event
-      const replayRes = await request(app).post(`/outbox/${eventId}/replay`);
+      const replayRes = await request(app)
+        .post(`/outbox/${eventId}/replay`)
+        .set('Authorization', 'Bearer lf_live_demo_key_for_chaos_simulator_1234567890');
       expect(replayRes.status).toBe(200);
       expect(replayRes.body.event.status).toBe('PENDING');
       expect(replayRes.body.event.attempts).toBe(0);
@@ -250,7 +252,9 @@ describe('LedgerFlow Phase 3 - Webhook Worker & Mock Merchant Suite', () => {
 
     it('should return 404 when attempting to replay non-existent outbox event', async () => {
       const nonExistentId = uuidv4();
-      const res = await request(app).post(`/outbox/${nonExistentId}/replay`);
+      const res = await request(app)
+        .post(`/outbox/${nonExistentId}/replay`)
+        .set('Authorization', 'Bearer lf_live_demo_key_for_chaos_simulator_1234567890');
       expect(res.status).toBe(404);
       expect(res.body.error).toBe('Not Found');
     });

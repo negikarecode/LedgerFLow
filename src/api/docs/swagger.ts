@@ -17,12 +17,52 @@ export const openApiSpec = {
   ],
   tags: [
     { name: 'Health', description: 'System health checks' },
+    { name: 'Admin', description: 'Merchant and API key lifecycle administration' },
     { name: 'Accounts', description: 'Double-entry account management' },
     { name: 'Transfers', description: 'Idempotent double-entry fund transfers' },
+    { name: 'Webhook Endpoints', description: 'Registered per-merchant webhook endpoints with SSRF protection' },
     { name: 'Outbox', description: 'Transactional outbox inspection and replay' },
     { name: 'Mock Merchant', description: 'Mock merchant receiver for webhook demos' },
   ],
   paths: {
+    '/admin/merchants': {
+      post: {
+        tags: ['Admin'],
+        summary: 'Bootstrap merchant and generate first API key',
+        description: 'Creates a merchant tenant and generates its initial live API key. Protected by ADMIN_TOKEN.',
+        security: [{ AdminAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                $ref: '#/components/schemas/CreateMerchantRequest',
+              },
+            },
+          },
+        },
+        responses: {
+          '201': {
+            description: 'Merchant and initial API key generated',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/CreateMerchantResponse',
+                },
+              },
+            },
+          },
+          '401': {
+            description: 'Missing or invalid admin bearer token',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorResponse' },
+              },
+            },
+          },
+        },
+      },
+    },
     '/health': {
       get: {
         tags: ['Health'],
@@ -56,7 +96,8 @@ export const openApiSpec = {
       get: {
         tags: ['Accounts'],
         summary: 'List accounts',
-        description: 'Retrieves accounts with current balances calculated from the double-entry ledger.',
+        description: 'Retrieves accounts with current balances calculated from the double-entry ledger scoped to the authenticated merchant.',
+        security: [{ ApiKeyAuth: [] }],
         parameters: [
           {
             name: 'limit',
@@ -88,6 +129,7 @@ export const openApiSpec = {
         tags: ['Accounts'],
         summary: 'Create test account / wallet',
         description: 'Creates a new account and optionally credits it with an initial seed balance in paise.',
+        security: [{ ApiKeyAuth: [] }],
         requestBody: {
           required: true,
           content: {
@@ -127,6 +169,7 @@ export const openApiSpec = {
         tags: ['Accounts'],
         summary: 'Get account by ID',
         description: 'Retrieves an account by its UUID with balance and recent ledger entries.',
+        security: [{ ApiKeyAuth: [] }],
         parameters: [
           {
             name: 'id',
@@ -165,6 +208,7 @@ export const openApiSpec = {
         tags: ['Accounts'],
         summary: 'Get account ledger history',
         description: 'Returns the account balance and chronological double-entry ledger entries.',
+        security: [{ ApiKeyAuth: [] }],
         parameters: [
           {
             name: 'id',
@@ -204,6 +248,7 @@ export const openApiSpec = {
         summary: 'Execute idempotent double-entry transfer',
         description:
           'Atomically transfers funds from one account to another using double-entry bookkeeping with deadlock-free row locking, idempotency guarantees, and transactional outbox event creation.',
+        security: [{ ApiKeyAuth: [] }],
         parameters: [
           {
             name: 'Idempotency-Key',
@@ -283,11 +328,126 @@ export const openApiSpec = {
         },
       },
     },
+    '/webhook-endpoints': {
+      get: {
+        tags: ['Webhook Endpoints'],
+        summary: 'List registered webhook endpoints',
+        description: 'Lists all webhook endpoints registered for the authenticated merchant with masked secrets.',
+        security: [{ ApiKeyAuth: [] }],
+        responses: {
+          '200': {
+            description: 'List of registered webhook endpoints',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/WebhookEndpointListResponse',
+                },
+              },
+            },
+          },
+        },
+      },
+      post: {
+        tags: ['Webhook Endpoints'],
+        summary: 'Register new webhook endpoint with SSRF protection',
+        description:
+          'Registers a new webhook destination URL. Validates target URL against SSRF rules (rejecting loopback, private, link-local, metadata, and CGNAT ranges). Generates signing secret revealed strictly once.',
+        security: [{ ApiKeyAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                $ref: '#/components/schemas/CreateWebhookEndpointRequest',
+              },
+            },
+          },
+        },
+        responses: {
+          '201': {
+            description: 'Webhook endpoint registered successfully',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/WebhookEndpointCreatedResponse',
+                },
+              },
+            },
+          },
+          '400': {
+            description: 'Validation error or SSRF violation',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorResponse' },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/webhook-endpoints/{id}': {
+      delete: {
+        tags: ['Webhook Endpoints'],
+        summary: 'Delete webhook endpoint',
+        description: 'Deletes a webhook endpoint owned by the authenticated merchant.',
+        security: [{ ApiKeyAuth: [] }],
+        parameters: [
+          {
+            name: 'id',
+            in: 'path',
+            required: true,
+            description: 'UUID of the webhook endpoint',
+            schema: { type: 'string', format: 'uuid' },
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'Webhook endpoint deleted successfully',
+          },
+          '404': {
+            description: 'Webhook endpoint not found',
+          },
+        },
+      },
+    },
+    '/webhook-endpoints/{id}/rotate-secret': {
+      post: {
+        tags: ['Webhook Endpoints'],
+        summary: 'Rotate webhook signing secret',
+        description: 'Rotates the HMAC signing secret for a registered webhook endpoint. Revealed strictly once.',
+        security: [{ ApiKeyAuth: [] }],
+        parameters: [
+          {
+            name: 'id',
+            in: 'path',
+            required: true,
+            description: 'UUID of the webhook endpoint',
+            schema: { type: 'string', format: 'uuid' },
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'Secret rotated successfully',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/WebhookEndpointCreatedResponse',
+                },
+              },
+            },
+          },
+          '404': {
+            description: 'Webhook endpoint not found',
+          },
+        },
+      },
+    },
     '/outbox': {
       get: {
         tags: ['Outbox'],
         summary: 'List transactional outbox events',
-        description: 'Lists recent webhook delivery events recorded in the transactional outbox.',
+        description: 'Lists recent webhook delivery events recorded in the transactional outbox scoped to the authenticated merchant.',
+        security: [{ ApiKeyAuth: [] }],
         parameters: [
           {
             name: 'limit',
@@ -330,6 +490,7 @@ export const openApiSpec = {
         tags: ['Outbox'],
         summary: 'Replay dead-lettered outbox event',
         description: 'Resets a DEAD_LETTER outbox event back to PENDING with attempts reset to 0 for redelivery.',
+        security: [{ ApiKeyAuth: [] }],
         parameters: [
           {
             name: 'id',
@@ -439,7 +600,53 @@ export const openApiSpec = {
     },
   },
   components: {
+    securitySchemes: {
+      ApiKeyAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'API Key (lf_live_...)',
+        description: 'Merchant API Key (e.g. Bearer lf_live_...)',
+      },
+      AdminAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        description: 'Admin bootstrap token configured via ADMIN_TOKEN environment variable',
+      },
+    },
     schemas: {
+      CreateMerchantRequest: {
+        type: 'object',
+        required: ['name'],
+        properties: {
+          name: { type: 'string', example: 'Acme Payments' },
+        },
+      },
+      CreateMerchantResponse: {
+        type: 'object',
+        properties: {
+          merchant: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', format: 'uuid' },
+              name: { type: 'string' },
+              created_at: { type: 'string', format: 'date-time' },
+            },
+          },
+          api_key: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', format: 'uuid' },
+              key: {
+                type: 'string',
+                example: 'lf_live_a1b2c3d4...',
+                description: 'Full plaintext API key. Displayed ONLY ONCE upon creation.',
+              },
+              key_prefix: { type: 'string', example: 'lf_live_a1b2' },
+              created_at: { type: 'string', format: 'date-time' },
+            },
+          },
+        },
+      },
       HealthResponse: {
         type: 'object',
         properties: {
@@ -574,11 +781,61 @@ export const openApiSpec = {
             example: 25000,
             description: 'Amount in paise to transfer (25000 = ₹250.00)',
           },
-          webhook_url: {
+        },
+      },
+      CreateWebhookEndpointRequest: {
+        type: 'object',
+        required: ['url'],
+        properties: {
+          url: {
             type: 'string',
             format: 'uri',
-            example: 'https://webhook.site/test-hook',
-            description: 'Optional URL for async webhook notification via outbox',
+            example: 'https://api.merchant.com/webhooks',
+            description: 'Destination URL for webhooks. Validated against SSRF.',
+          },
+          event_types: {
+            type: 'array',
+            items: { type: 'string' },
+            default: ['transfer.completed'],
+            example: ['transfer.completed'],
+          },
+        },
+      },
+      WebhookEndpoint: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', format: 'uuid' },
+          merchant_id: { type: 'string', format: 'uuid' },
+          url: { type: 'string', format: 'uri' },
+          secret: { type: 'string', example: 'whsec_a1b2...c3d4' },
+          event_types: { type: 'array', items: { type: 'string' } },
+          status: { type: 'string', enum: ['ACTIVE', 'DISABLED'] },
+          created_at: { type: 'string', format: 'date-time' },
+        },
+      },
+      WebhookEndpointCreatedResponse: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', format: 'uuid' },
+          merchant_id: { type: 'string', format: 'uuid' },
+          url: { type: 'string', format: 'uri' },
+          secret: {
+            type: 'string',
+            example: 'whsec_e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+            description: 'Full endpoint signing secret. Displayed ONLY ONCE upon creation or rotation.',
+          },
+          event_types: { type: 'array', items: { type: 'string' } },
+          status: { type: 'string', enum: ['ACTIVE', 'DISABLED'] },
+          created_at: { type: 'string', format: 'date-time' },
+          warning: { type: 'string' },
+        },
+      },
+      WebhookEndpointListResponse: {
+        type: 'object',
+        properties: {
+          data: {
+            type: 'array',
+            items: { $ref: '#/components/schemas/WebhookEndpoint' },
           },
         },
       },

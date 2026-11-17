@@ -2,26 +2,30 @@ import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { getClient, query } from '../../db/pool';
 
+const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
+
 export async function createAccount(
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
   const { owner_name, currency, initial_credit_paise } = req.body;
+  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
   const client = await getClient();
 
   try {
     await client.query('BEGIN');
 
-    // 1. Insert Account
+    // 1. Insert Account scoped to authenticated merchant
     const accountInsertQuery = `
-      INSERT INTO accounts (owner_name, currency)
-      VALUES ($1, $2)
-      RETURNING id, owner_name, currency, created_at;
+      INSERT INTO accounts (owner_name, currency, merchant_id)
+      VALUES ($1, $2, $3)
+      RETURNING id, owner_name, currency, merchant_id, created_at;
     `;
     const accountResult = await client.query(accountInsertQuery, [
       owner_name,
       currency || 'INR',
+      merchantId,
     ]);
     const account = accountResult.rows[0];
 
@@ -48,6 +52,7 @@ export async function createAccount(
 
     res.status(201).json({
       id: account.id,
+      merchant_id: account.merchant_id,
       owner_name: account.owner_name,
       currency: account.currency,
       balance_paise: initial_credit_paise || 0,
@@ -68,12 +73,14 @@ export async function listAccounts(
   next: NextFunction
 ): Promise<void> {
   try {
+    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
     const limit = Number(req.query.limit) || 50;
     const offset = Number(req.query.offset) || 0;
 
     const listQuery = `
       SELECT 
         a.id,
+        a.merchant_id,
         a.owner_name,
         a.currency,
         a.created_at,
@@ -86,16 +93,17 @@ export async function listAccounts(
         ), 0)::BIGINT AS balance_paise
       FROM accounts a
       LEFT JOIN ledger_entries le ON a.id = le.account_id
-      GROUP BY a.id, a.owner_name, a.currency, a.created_at
+      WHERE a.merchant_id = $1
+      GROUP BY a.id, a.merchant_id, a.owner_name, a.currency, a.created_at
       ORDER BY a.created_at DESC
-      LIMIT $1 OFFSET $2;
+      LIMIT $2 OFFSET $3;
     `;
 
-    const countQuery = `SELECT COUNT(*)::INT AS total FROM accounts;`;
+    const countQuery = `SELECT COUNT(*)::INT AS total FROM accounts WHERE merchant_id = $1;`;
 
     const [accountsResult, countResult] = await Promise.all([
-      query(listQuery, [limit, offset]),
-      query(countQuery),
+      query(listQuery, [merchantId, limit, offset]),
+      query(countQuery, [merchantId]),
     ]);
 
     const accounts = accountsResult.rows.map((row) => ({
@@ -123,10 +131,12 @@ export async function getAccountById(
 ): Promise<void> {
   try {
     const { id } = req.params;
+    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
 
     const accountQuery = `
       SELECT 
         a.id,
+        a.merchant_id,
         a.owner_name,
         a.currency,
         a.created_at,
@@ -139,12 +149,13 @@ export async function getAccountById(
         ), 0)::BIGINT AS balance_paise
       FROM accounts a
       LEFT JOIN ledger_entries le ON a.id = le.account_id
-      WHERE a.id = $1
-      GROUP BY a.id, a.owner_name, a.currency, a.created_at;
+      WHERE a.id = $1 AND a.merchant_id = $2
+      GROUP BY a.id, a.merchant_id, a.owner_name, a.currency, a.created_at;
     `;
 
-    const accountResult = await query(accountQuery, [id]);
+    const accountResult = await query(accountQuery, [id, merchantId]);
 
+    // Return 404 for non-existent OR foreign merchant accounts
     if (accountResult.rows.length === 0) {
       res.status(404).json({
         error: 'Not Found',
@@ -167,6 +178,7 @@ export async function getAccountById(
 
     res.status(200).json({
       id: account.id,
+      merchant_id: account.merchant_id,
       owner_name: account.owner_name,
       currency: account.currency,
       balance_paise: Number(account.balance_paise),
@@ -188,14 +200,16 @@ export async function getAccountLedger(
 ): Promise<void> {
   try {
     const { id } = req.params;
+    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
 
     const accountQuery = `
-      SELECT id, owner_name, currency, created_at 
+      SELECT id, merchant_id, owner_name, currency, created_at 
       FROM accounts 
-      WHERE id = $1;
+      WHERE id = $1 AND merchant_id = $2;
     `;
-    const accountResult = await query(accountQuery, [id]);
+    const accountResult = await query(accountQuery, [id, merchantId]);
 
+    // Return 404 for non-existent OR foreign merchant accounts
     if (accountResult.rows.length === 0) {
       res.status(404).json({
         error: 'Not Found',
@@ -229,6 +243,7 @@ export async function getAccountLedger(
 
     res.status(200).json({
       account_id: account.id,
+      merchant_id: account.merchant_id,
       owner_name: account.owner_name,
       currency: account.currency,
       balance_paise: Number(balanceResult.rows[0].balance_paise),

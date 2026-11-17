@@ -3,11 +3,14 @@ import crypto from 'crypto';
 import { redis } from '../../redis/client';
 import { query } from '../../db/pool';
 
+const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
+
 declare global {
   namespace Express {
     interface Request {
       idempotency?: {
         key: string;
+        merchantId: string;
         redisKey: string;
         requestHash: string;
       };
@@ -46,8 +49,10 @@ export async function idempotencyMiddleware(
     return;
   }
 
+  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
   const trimmedKey = idempotencyKey.trim();
-  const redisKey = `idemp:${trimmedKey}`;
+  // Namespace Redis lock and cache key by merchantId
+  const redisKey = `idemp:${merchantId}:${trimmedKey}`;
   const requestHash = hashRequestBody(req.body);
 
   try {
@@ -88,10 +93,10 @@ export async function idempotencyMiddleware(
 
     // 2. Lock acquired in Redis or Redis had invalid value; check PostgreSQL durable storage
     const dbResult = await query(
-      `SELECT key, request_hash, response_status, response_body 
+      `SELECT key, merchant_id, request_hash, response_status, response_body 
        FROM idempotency_keys 
-       WHERE key = $1`,
-      [trimmedKey]
+       WHERE key = $1 AND merchant_id = $2`,
+      [trimmedKey, merchantId]
     );
 
     if (dbResult.rows.length > 0) {
@@ -129,6 +134,7 @@ export async function idempotencyMiddleware(
     // 3. New request: attach idempotency context to request
     req.idempotency = {
       key: trimmedKey,
+      merchantId,
       redisKey,
       requestHash,
     };

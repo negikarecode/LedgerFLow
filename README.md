@@ -6,10 +6,10 @@
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/features/actions)
-[![Tests](https://img.shields.io/badge/Tests-33%2F33%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Tests-64%2F64%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **LedgerFlow** is a fault-tolerant, idempotent double-entry financial ledger and webhook delivery engine that guarantees strict balance conservation (0 paise lost or created), zero-overdraft concurrency control, and at-least-once signed webhook dispatch with automatic crash recovery.
+> **LedgerFlow** is an enterprise-grade, multi-tenant, idempotent double-entry financial ledger and webhook delivery engine that guarantees strict balance conservation (0 paise lost or created), zero-overdraft concurrency control, cryptographic API-key multi-tenancy, and at-least-once signed webhook dispatch with automatic crash recovery.
 
 ---
 
@@ -19,21 +19,23 @@ LedgerFlow decouples synchronous money movement from asynchronous partner notifi
 
 ```mermaid
 flowchart LR
-    Client["Client / Chaos UI<br/>(Browser / REST Client)"]
-    API["Express API Server<br/>(Zod Validation + Idempotency Middleware)"]
-    Redis[("Redis 7<br/>• In-Flight Mutex (NX)<br/>• Fast 24h Replay Cache<br/>• BullMQ Work Queue")]
-    Postgres[("PostgreSQL 16<br/>• accounts<br/>• ledger_entries (Immutable)<br/>• idempotency_keys (Durable)<br/>• outbox_events (Transactional)")]
+    Client["Client / Chaos UI<br/>(Bearer API Key Auth)"]
+    API["Express API Server<br/>(Zod Validation + Scoped Idempotency)"]
+    Redis[("Redis 7<br/>• Namespaced Mutex (NX)<br/>• Fast Replay Cache<br/>• BullMQ Work Queue")]
+    Postgres[("PostgreSQL 16<br/>• merchants & api_keys<br/>• accounts (tenant-scoped)<br/>• ledger_entries (Immutable)<br/>• webhook_endpoints<br/>• outbox_events")]
     Worker["Outbox Worker<br/>(BullMQ Consumer + Exponential Backoff)"]
-    Merchant["Mock Merchant Receiver<br/>(HMAC-SHA256 Signature Verification)"]
+    SSRF["SSRF Defense Engine<br/>• DNS Rebinding Pinning<br/>• Private & Metadata Filter<br/>• Hop-by-Hop Redirect Check"]
+    Merchant["Registered Webhook Receivers<br/>(Stripe-Style HMAC t=...,v1=...)"]
 
-    Client -->|1. POST /transfers with Idempotency-Key| API
-    API -->|2. SET idemp:key LOCKED NX (Acquire mutex)| Redis
-    API -->|3. ACID Tx: SELECT FOR UPDATE, Debit/Credit, Outbox insert| Postgres
-    API -->|4. Release lock & Cache 201 response| Redis
+    Client -->|1. POST /transfers (Idempotency-Key)| API
+    API -->|2. SET idemp:merchant:key LOCKED NX| Redis
+    API -->|3. ACID Tx: Lock Accounts, Entries, Fan-out Outbox| Postgres
+    API -->|4. Release lock & Cache response| Redis
     Worker -->|5. Sweep PENDING events into BullMQ| Postgres
     Worker -->|6. Process job with retry backoff| Redis
-    Worker -->|7. POST payload + X-LedgerFlow-Signature| Merchant
-    Worker -->|8. Mark event DELIVERED / DEAD_LETTER| Postgres
+    Worker -->|7. Validate & pin target IP| SSRF
+    SSRF -->|8. POST payload + HMAC signature| Merchant
+    Worker -->|9. Mark event DELIVERED / DEAD_LETTER| Postgres
 ```
 
 ---
@@ -166,35 +168,53 @@ npm run benchmark
 └─────────┴────────────────────────────────┴──────────────────────────────┘
 ```
 
-### 2. Comprehensive Test Suite (33/33 Passing)
-LedgerFlow includes extensive automated integration and unit tests using **Vitest** and **Supertest**:
+### 2. Comprehensive Test Suite (64/64 Passing)
+LedgerFlow includes extensive automated integration, concurrency, security, and unit tests using **Vitest** and **Supertest**:
 
 ```bash
 npm test
 ```
 
 ```
- ✓ tests/api.test.ts (12 tests) 248ms
- ✓ tests/transfers.test.ts (11 tests) 8379ms
-   ✓ Validation & Header Checks > should return 400 Bad Request when Idempotency-Key header is missing
-   ✓ Validation & Header Checks > should return 400 Bad Request when from_account_id equals to_account_id
-   ✓ Normal Transfer & Outbox Creation > should atomically transfer funds between accounts and record outbox event
-   ✓ Race-Condition Stress Test > should handle 50 concurrent transfers of 20000 paise on 50000 paise account: exactly 2 succeed (201), 48 fail (422), final balance 10000
-   ✓ Opposite-Direction Deadlock Test > should fire concurrent A -> B and B -> A transfers and assert zero PostgreSQL deadlocks
- ✓ tests/worker.test.ts (10 tests) 1166ms
-   ✓ Signature Generation & Verification > should sign payload with sha256 HMAC and verify successfully
-   ✓ Outbox Worker & Mock Merchant Suite > should retry on merchant 500, then recover to DELIVERED on merchant 200
+ ✓ tests/worker.test.ts (10 tests)
+   ✓ Retry -> Recovery Pipeline: retries on merchant 500, recovers to DELIVERED on 200
+ ✓ tests/auth.test.ts (15 tests)
+   ✓ Admin Bootstrap Authentication (ADMIN_TOKEN): creates merchant & live API key
+   ✓ Merchant API Key Authentication (requireApiKey): validates prefix & constant-time hash
+   ✓ Multi-Tenancy Cross-Tenant Resource Isolation: returns 404 (not 403) on foreign accounts, ledgers, outboxes
+   ✓ Namespaced Idempotency Keys across Tenants: identical keys between merchants never collide
+ ✓ tests/webhooks.test.ts (16 tests)
+   ✓ SSRF Security: blocks private IPv4 (10/8, 172.16/12, 192.168/16, 127/8) & IPv6
+   ✓ SSRF Security: blocks AWS/GCP/Azure link-local metadata (169.254.169.254)
+   ✓ SSRF Security: resolves hostnames & blocks DNS rebinding via IP pinning
+   ✓ SSRF Security: validates redirects on every hop & blocks redirect to private IP
+   ✓ Stripe-Style Signatures: verifies HMAC-SHA256 (t=...,v1=...) & rejects stale timestamps
+   ✓ Endpoints CRUD: registers, lists, deletes endpoints & rotates secrets securely
+   ✓ Fan-Out Outbox: automatically generates outbox event per active registered endpoint on transfer
+ ✓ tests/api.test.ts (12 tests)
+   ✓ Accounts & Ledger balance calculation (BIGINT paise)
+ ✓ tests/transfers.test.ts (11 tests)
+   ✓ Race-Condition Stress: 50 concurrent transfers; zero overdraft guarantee
+   ✓ Deadlock Prevention: opposite-direction transfers (A->B and B->A); zero PostgreSQL deadlocks
 
- Test Files  3 passed (3)
-      Tests  33 passed (33)
-   Duration  12.43s
+ Test Files  5 passed (5)
+      Tests  64 passed (64)
+   Duration  9.15s
 ```
 
 ---
 
 ## Core Engineering Principles
 
-### 1. Integer-Only Accounting (Paise, Not Floats)
+### 1. Multi-Tenant Architecture & Cryptographic API Keys
+LedgerFlow implements secure multi-tenancy with strict cryptographic guarantees:
+- **API Key Format:** `lf_live_<random 32+ bytes base64url>`.
+- **Zero Raw Key Storage:** Keys are SHA-256 hashed at rest. The full raw key is revealed **strictly once** at creation time.
+- **Timing Attack Defense:** All key and admin token comparisons execute in constant time via Node.js `crypto.timingSafeEqual`.
+- **Information Leakage Prevention:** Any attempt by a tenant to query, read, or transfer to/from a foreign tenant's account returns HTTP `404 Not Found` (never `403 Forbidden`), completely eliminating resource enumeration vulnerabilities.
+- **Tenant-Namespaced Idempotency:** Redis locking (`idemp:<merchant_id>:<key>`) and PostgreSQL durable constraints (`PRIMARY KEY (merchant_id, key)`) ensure that two different merchants using identical idempotency keys will never collide or cross-contaminate.
+
+### 2. Integer-Only Accounting (Paise, Not Floats)
 IEEE 754 floating-point arithmetic causes rounding errors (`0.1 + 0.2 === 0.30000000000000004`). LedgerFlow stores all amounts strictly as 64-bit integers (`BIGINT`) representing **paise** (1 INR = 100 paise; e.g. ₹500.25 = 50,025 paise). Balance calculations utilize SQL `SUM()` aggregations over immutable `CREDIT` and `DEBIT` entries.
 
 ### 2. Deadlock-Free Concurrency Control
@@ -215,11 +235,25 @@ Idempotency ensures that network retries or accidental double-clicks never dupli
 2. **PostgreSQL Durable Store:** On commit, the original HTTP status and response payload are written to `idempotency_keys` inside the **same database transaction** as the ledger entries.
 3. **Subsequent Replays:** Return the cached response with header `X-Idempotent-Replay: true` in <2ms without touching the ledger.
 
-### 4. Transactional Outbox & HMAC Webhooks
+### 4. Transactional Outbox & Fan-Out Delivery
 Dual-write problems occur when an API writes to a database and publishes an event to an external service: if the network fails midway, systems desynchronize.
-- LedgerFlow writes the financial ledger and the `outbox_events` record in a **single atomic PostgreSQL transaction**.
-- A dedicated background worker consumes pending outbox events using BullMQ, dispatches HTTP POST requests to merchant endpoints, and attaches an `X-LedgerFlow-Signature: sha256=<hmac>` header computed with the merchant's secret key.
+- LedgerFlow writes the financial ledger and all subscribed `outbox_events` records in a **single atomic PostgreSQL transaction**.
+- `POST /transfers` does not accept raw client-specified URLs; instead, it looks up all registered `ACTIVE` webhook endpoints for the authenticated merchant subscribed to `transfer.completed` and enqueues outbox events atomically.
+- A dedicated background worker consumes pending outbox events using BullMQ, dispatches HTTP POST requests to merchant endpoints, and attaches cryptographic signatures.
 - Upstream outages trigger exponential backoff retries (`2s, 4s, 8s, 16s...`) before dead-letter routing.
+
+### 5. Multi-Layer SSRF Defense & Stripe-Style Webhook Signatures
+Webhooks dispatched to arbitrary partner URLs present severe Server-Side Request Forgery (SSRF) and replay risks:
+- **Dedicated SSRF Engine (`src/security/ssrf.ts`):**
+  - **Comprehensive CIDR Filtering:** Blocks private IPv4 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`), CGNAT (`100.64.0.0/10`), IPv6 loopback/ULA/link-local (`::1`, `fc00::/7`, `fe80::/10`), and cloud provider metadata services (`169.254.169.254` on AWS, GCP, Azure).
+  - **DNS Rebinding Protection:** Resolves hostnames via DNS and pins the validated IP address at connection time using a custom HTTP/HTTPS `Agent` `lookup` callback, ensuring the socket connects exclusively to the verified IP.
+  - **Hop-by-Hop Redirect Validation:** Re-resolves and inspects every redirect hop (up to 3 hops), immediately terminating any request redirecting to private or loopback addresses.
+  - **Hard Timeouts & Size Caps:** 5-second socket timeout and 64 KB response size cap to prevent slowloris or denial-of-service memory exhaustion.
+  - **Production Guard:** Enforces `https://` in production; supports `ALLOW_PRIVATE_WEBHOOK_TARGETS=true` for local development and Docker demo suites.
+- **Stripe-Style Webhook Signatures:**
+  - Each endpoint is assigned a secret (`whsec_<64 hex bytes>`), revealed strictly once at creation and rotatable on demand.
+  - Headers contain `X-LedgerFlow-Signature: t=<unix_timestamp>,v1=<hmac_sha256>`.
+  - Receivers verify HMAC over `${t}.${payload}` and reject timestamps older than tolerance (e.g. 300s) to completely defeat replay attacks.
 
 ---
 
@@ -229,14 +263,20 @@ Interactive OpenAPI 3.0 documentation is available at [http://localhost:3000/doc
 
 | Method | Endpoint | Description | Key Headers / Body |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/health` | PostgreSQL & Redis health check | Returns status, latencies |
-| `GET` | `/accounts` | List accounts with computed balances | — |
-| `POST` | `/accounts` | Create account with seed credit | `{ owner_name, currency, initial_credit_paise }` |
-| `GET` | `/accounts/:id` | Get account details & recent ledger entries | — |
-| `GET` | `/accounts/:id/ledger`| Get calculated balance & entry statement | — |
-| `POST` | `/transfers` | Atomic transfer between accounts | Header: `Idempotency-Key` (required)<br/>Body: `{ from_account_id, to_account_id, amount_paise, webhook_url }` |
-| `GET` | `/outbox` | View outbox events and delivery status | Query: `?status=PENDING\|DELIVERED\|DEAD_LETTER` |
-| `GET` | `/mock-merchant/events`| View events received by mock merchant | — |
+| `POST` | `/admin/merchants` | Admin bootstrap tenant & generate first API key | Header: `Authorization: Bearer <ADMIN_TOKEN>`<br/>Body: `{ name }` |
+| `GET` | `/health` | PostgreSQL & Redis health check (Public) | Returns status, latencies |
+| `GET` | `/accounts` | List accounts scoped to authenticated merchant | Header: `Authorization: Bearer <api_key>` |
+| `POST` | `/accounts` | Create account with optional seed credit | Header: `Authorization: Bearer <api_key>`<br/>Body: `{ owner_name, currency, initial_credit_paise }` |
+| `GET` | `/accounts/:id` | Get account details & recent ledger entries | Header: `Authorization: Bearer <api_key>` |
+| `GET` | `/accounts/:id/ledger`| Get calculated balance & entry statement | Header: `Authorization: Bearer <api_key>` |
+| `POST` | `/transfers` | Atomic transfer; enqueues outbox events to registered endpoints | Headers: `Authorization: Bearer <api_key>`, `Idempotency-Key`<br/>Body: `{ from_account_id, to_account_id, amount_paise }` |
+| `GET` | `/webhook-endpoints` | List registered webhook endpoints for tenant | Header: `Authorization: Bearer <api_key>` |
+| `POST` | `/webhook-endpoints` | Register new webhook endpoint (SSRF validated) | Header: `Authorization: Bearer <api_key>`<br/>Body: `{ url, event_types, status }` |
+| `DELETE`| `/webhook-endpoints/:id` | Delete registered webhook endpoint | Header: `Authorization: Bearer <api_key>` |
+| `POST` | `/webhook-endpoints/:id/rotate-secret` | Rotate webhook signing secret | Header: `Authorization: Bearer <api_key>` |
+| `GET` | `/outbox` | View outbox events scoped to merchant | Header: `Authorization: Bearer <api_key>`<br/>Query: `?status=PENDING\|DELIVERED\|DEAD_LETTER` |
+| `POST` | `/outbox/:id/replay` | Reset dead-letter event for immediate redelivery | Header: `Authorization: Bearer <api_key>` |
+| `GET` | `/mock-merchant/status`| View status and verified HMAC payloads received | — (Public demo tool) |
 | `POST` | `/mock-merchant/crash` | Toggle mock merchant crash mode | `{ "crash": true \| false }` |
 
 ---
@@ -251,7 +291,7 @@ LedgerFlow includes an automated CI pipeline defined in [`.github/workflows/ci.y
   2. `tsc --noEmit` (strict TypeScript type verification)
   3. `npm run migrate` (applies schema migrations)
   4. `npm run build` (builds production artifacts)
-  5. `npm test` (executes 33 Vitest integration test cases)
+  5. `npm test` (executes 64 Vitest integration test cases)
 
 ---
 

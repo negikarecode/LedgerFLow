@@ -3,6 +3,7 @@ import { getRedisClient } from '../redis/client';
 import { env } from '../config/env';
 import { getClient, query } from '../db/pool';
 import { signPayload } from './signature';
+import { dispatchSecureWebhook } from '../security/ssrf';
 
 export interface WebhookDeliveryPayload {
   eventId: string;
@@ -10,6 +11,8 @@ export interface WebhookDeliveryPayload {
   targetUrl: string;
   payload: Record<string, any>;
   attempts: number;
+  secret?: string;
+  endpointId?: string;
 }
 
 export const QUEUE_NAME = 'webhook-delivery';
@@ -37,11 +40,13 @@ export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number
     await client.query('BEGIN');
 
     const selectQuery = `
-      SELECT id, event_type, target_url, payload, attempts
-      FROM outbox_events
-      WHERE status = 'PENDING'
-        AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-      ORDER BY created_at ASC
+      SELECT o.id, o.event_type, o.target_url, o.payload, o.attempts, o.endpoint_id,
+             e.secret as endpoint_secret
+      FROM outbox_events o
+      LEFT JOIN webhook_endpoints e ON e.id = o.endpoint_id
+      WHERE o.status = 'PENDING'
+        AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
+      ORDER BY o.created_at ASC
       LIMIT $1
       FOR UPDATE SKIP LOCKED;
     `;
@@ -74,6 +79,8 @@ export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number
           targetUrl: row.target_url,
           payload: row.payload,
           attempts: Number(row.attempts),
+          secret: row.endpoint_secret || env.WEBHOOK_SECRET,
+          endpointId: row.endpoint_id,
         },
         {
           jobId: `${row.id}-${row.attempts}-${Date.now()}`,
@@ -99,26 +106,26 @@ export async function processOutboxDelivery(
   data: WebhookDeliveryPayload
 ): Promise<{ delivered: boolean; deadLetter?: boolean; error?: string }> {
   const payloadString = JSON.stringify(data.payload);
-  const { signatureHeader } = signPayload(payloadString, env.WEBHOOK_SECRET);
+  const signingSecret = data.secret || env.WEBHOOK_SECRET;
+  const { signatureHeader } = signPayload(payloadString, signingSecret);
 
   let success = false;
   let errorReason = '';
 
   try {
-    const response = await fetch(data.targetUrl, {
-      method: 'POST',
+    const response = await dispatchSecureWebhook({
+      url: data.targetUrl,
+      payload: payloadString,
       headers: {
-        'Content-Type': 'application/json',
         'X-LedgerFlow-Signature': signatureHeader,
       },
-      body: payloadString,
-      signal: AbortSignal.timeout(5000), // 5-second timeout
+      timeoutMs: 5000,
     });
 
-    if (response.ok) {
+    if (response.statusCode >= 200 && response.statusCode < 300) {
       success = true;
     } else {
-      errorReason = `HTTP ${response.status} ${response.statusText}`;
+      errorReason = `HTTP ${response.statusCode} ${response.statusText}`;
     }
   } catch (err: any) {
     errorReason = err.message || 'Network request failed';

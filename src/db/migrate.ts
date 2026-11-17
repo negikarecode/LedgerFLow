@@ -19,18 +19,43 @@ export async function runMigrations(): Promise<void> {
 
   console.log(`[Migrations] Scanning ${migrationsDir}...`);
 
+  // Ensure schema_migrations table exists to track applied migrations
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      filename VARCHAR(255) PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   const files = fs.readdirSync(migrationsDir)
     .filter((f) => f.endsWith('.sql'))
     .sort();
 
   for (const file of files) {
+    const checkResult = await pool.query(
+      `SELECT filename FROM schema_migrations WHERE filename = $1`,
+      [file]
+    );
+
+    if (checkResult.rows.length > 0) {
+      console.log(`[Migrations] Migration ${file} already applied, skipping.`);
+      continue;
+    }
+
     const filePath = path.join(migrationsDir, file);
     const sql = fs.readFileSync(filePath, 'utf8');
     console.log(`[Migrations] Executing ${file}...`);
     try {
+      await pool.query('BEGIN');
       await pool.query(sql);
+      await pool.query(
+        `INSERT INTO schema_migrations (filename) VALUES ($1)`,
+        [file]
+      );
+      await pool.query('COMMIT');
       console.log(`[Migrations] Successfully executed ${file}`);
     } catch (err) {
+      await pool.query('ROLLBACK').catch(() => {});
       console.error(`[Migrations] Error executing ${file}:`, err);
       throw err;
     }

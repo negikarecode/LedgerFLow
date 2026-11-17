@@ -8,6 +8,7 @@ interface BenchmarkResult {
 }
 
 const BASE_URL = process.env.API_URL || `http://localhost:${process.env.PORT || 3000}`;
+const API_KEY = process.env.API_KEY || 'lf_live_demo_key_for_chaos_simulator_1234567890';
 
 async function checkHealth(): Promise<boolean> {
   try {
@@ -22,7 +23,10 @@ async function checkHealth(): Promise<boolean> {
 async function createAccount(name: string, initialPaise: number): Promise<{ id: string; balance_paise: number }> {
   const res = await fetch(`${BASE_URL}/accounts`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${API_KEY}`,
+    },
     body: JSON.stringify({
       owner_name: name,
       currency: 'INR',
@@ -39,7 +43,11 @@ async function createAccount(name: string, initialPaise: number): Promise<{ id: 
 }
 
 async function getAccountBalance(id: string): Promise<number> {
-  const res = await fetch(`${BASE_URL}/accounts/${id}/ledger`);
+  const res = await fetch(`${BASE_URL}/accounts/${id}/ledger`, {
+    headers: {
+      'Authorization': `Bearer ${API_KEY}`,
+    },
+  });
   if (!res.ok) {
     throw new Error(`Failed to fetch account balance for ${id}: HTTP ${res.status}`);
   }
@@ -94,6 +102,7 @@ export async function runBenchmark(totalRequests = 500, transferAmountPaise = 10
       headers: {
         'Content-Type': 'application/json',
         'Idempotency-Key': key,
+        'Authorization': `Bearer ${API_KEY}`,
       },
       body: JSON.stringify({
         from_account_id: sender.id,
@@ -155,6 +164,7 @@ export async function runBenchmark(totalRequests = 500, transferAmountPaise = 10
           headers: {
             'Content-Type': 'application/json',
             'Idempotency-Key': key,
+            'Authorization': `Bearer ${API_KEY}`,
           },
           body: JSON.stringify({
             from_account_id: sender.id,

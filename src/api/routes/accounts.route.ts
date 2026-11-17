@@ -5,6 +5,7 @@ import {
   getAccountById,
   getAccountLedger,
 } from '../controllers/accounts.controller';
+import { requireApiKey } from '../middlewares/auth.middleware';
 import {
   validateBody,
   validateParams,
@@ -17,6 +18,9 @@ import {
 import { paginationQuerySchema } from '../schemas/common.schema';
 
 export const accountsRouter = Router();
+
+// Protect all account routes with API-key authentication
+accountsRouter.use('/accounts', requireApiKey);
 
 accountsRouter.get(
   '/accounts',

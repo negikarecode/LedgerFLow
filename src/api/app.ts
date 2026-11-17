@@ -5,9 +5,11 @@ import morgan from 'morgan';
 import path from 'path';
 import fs from 'fs';
 import { healthRouter } from './routes/health.route';
+import { adminRouter } from './routes/admin.route';
 import { accountsRouter } from './routes/accounts.route';
 import { transfersRouter } from './routes/transfers.route';
 import { outboxRouter } from './routes/outbox.route';
+import { webhookEndpointsRouter } from './routes/webhook-endpoints.route';
 import { merchantRouter } from './routes/merchant.route';
 import { demoRouter } from './routes/demo.route';
 import { docsRouter } from './docs/swagger';
@@ -43,9 +45,11 @@ export function createApp(): Express {
 
   // Core API Routes
   app.use(healthRouter);
+  app.use(adminRouter);
   app.use(accountsRouter);
   app.use(transfersRouter);
   app.use(outboxRouter);
+  app.use(webhookEndpointsRouter);
   app.use(merchantRouter);
   app.use(demoRouter);
 

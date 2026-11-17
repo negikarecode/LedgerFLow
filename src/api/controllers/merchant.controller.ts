@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { env } from '../../config/env';
 import { redis } from '../../redis/client';
+import { query } from '../../db/pool';
 import { verifySignature } from '../../worker/signature';
 
 let inMemoryCrashMode = false;
@@ -82,11 +83,27 @@ export async function handleMerchantWebhook(
     const payloadString = JSON.stringify(req.body);
 
     // 1. Verify HMAC-SHA256 signature
-    const verification = verifySignature(
+    let verification = verifySignature(
       payloadString,
       signatureHeader,
       env.WEBHOOK_SECRET
     );
+
+    // If signature doesn't match default WEBHOOK_SECRET, check registered endpoints
+    if (!verification.valid) {
+      try {
+        const epResults = await query(
+          `SELECT secret FROM webhook_endpoints WHERE status = 'ACTIVE'`
+        );
+        for (const ep of epResults.rows) {
+          const v = verifySignature(payloadString, signatureHeader, ep.secret);
+          if (v.valid) {
+            verification = v;
+            break;
+          }
+        }
+      } catch {}
+    }
 
     if (!verification.valid) {
       res.status(401).json({

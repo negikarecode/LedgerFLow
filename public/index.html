@@ -122,6 +122,11 @@
       const [newOwner, setNewOwner] = useState('');
       const [newSeedInr, setNewSeedInr] = useState('500');
 
+      const DEMO_API_KEY = 'lf_live_demo_key_for_chaos_simulator_1234567890';
+      const authHeaders = {
+        'Authorization': `Bearer ${DEMO_API_KEY}`,
+      };
+
       const showToast = (message, type = 'info') => {
         setToast({ message, type, id: Date.now() });
         setTimeout(() => setToast(null), 3500);
@@ -130,7 +135,7 @@
       // Polling and API Fetchers
       const fetchAccounts = async () => {
         try {
-          const res = await fetch('/accounts?limit=50');
+          const res = await fetch('/accounts?limit=50', { headers: authHeaders });
           const data = await res.json();
           if (data.data) {
             setAccounts(data.data);
@@ -151,7 +156,7 @@
       const fetchLedger = async (id) => {
         if (!id) return;
         try {
-          const res = await fetch(`/accounts/${id}/ledger`);
+          const res = await fetch(`/accounts/${id}/ledger`, { headers: authHeaders });
           if (res.ok) {
             const data = await res.json();
             setAccountLedger(data);
@@ -163,7 +168,7 @@
 
       const fetchOutbox = async () => {
         try {
-          const res = await fetch('/outbox?limit=50');
+          const res = await fetch('/outbox?limit=50', { headers: authHeaders });
           const data = await res.json();
           if (data.data) setOutboxEvents(data.data);
         } catch (e) {
@@ -238,7 +243,7 @@
           const paise = Math.round((Number(newSeedInr) || 0) * 100);
           const res = await fetch('/accounts', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...authHeaders },
             body: JSON.stringify({
               owner_name: newOwner.trim(),
               currency: 'INR',
@@ -281,19 +286,18 @@
 
         try {
           const idempotencyKey = 'web-' + crypto.randomUUID();
-          const targetUrl = sendWebhook ? window.location.origin + '/mock-merchant/webhook' : undefined;
 
           const res = await fetch('/transfers', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
               'Idempotency-Key': idempotencyKey,
+              ...authHeaders,
             },
             body: JSON.stringify({
               from_account_id: fromAcc,
               to_account_id: toAcc,
               amount_paise: amountPaise,
-              webhook_url: targetUrl,
             }),
           });
 
@@ -320,7 +324,6 @@
 
         const sharedKey = 'double-tap-' + crypto.randomUUID();
         const amountPaise = Math.round(Number(transferAmountInr) * 100) || 10000;
-        const targetUrl = sendWebhook ? window.location.origin + '/mock-merchant/webhook' : undefined;
 
         try {
           const requests = Array.from({ length: 20 }, () =>
@@ -329,12 +332,12 @@
               headers: {
                 'Content-Type': 'application/json',
                 'Idempotency-Key': sharedKey,
+                ...authHeaders,
               },
               body: JSON.stringify({
                 from_account_id: fromAcc,
                 to_account_id: toAcc,
                 amount_paise: amountPaise,
-                webhook_url: targetUrl,
               }),
             }).then(async (res) => ({
               status: res.status,
@@ -378,13 +381,12 @@
 
         let initialBalance = 0;
         try {
-          const lRes = await fetch(`/accounts/${fromAcc}/ledger`);
+          const lRes = await fetch(`/accounts/${fromAcc}/ledger`, { headers: authHeaders });
           const lData = await lRes.json();
           initialBalance = lData.balance_paise || 0;
         } catch {}
 
         const singlePaise = 20000; // ₹200 per attempt
-        const targetUrl = sendWebhook ? window.location.origin + '/mock-merchant/webhook' : undefined;
 
         try {
           const requests = Array.from({ length: 20 }, (_, i) =>
@@ -393,12 +395,12 @@
               headers: {
                 'Content-Type': 'application/json',
                 'Idempotency-Key': `race-${i}-${crypto.randomUUID()}`,
+                ...authHeaders,
               },
               body: JSON.stringify({
                 from_account_id: fromAcc,
                 to_account_id: toAcc,
                 amount_paise: singlePaise,
-                webhook_url: targetUrl,
               }),
             }).then(async (res) => ({
               status: res.status,
@@ -411,7 +413,7 @@
           const insufficient = results.filter((r) => r.status === 422).length;
           const otherErrors = results.filter((r) => r.status !== 201 && r.status !== 422).length;
 
-          const finalRes = await fetch(`/accounts/${fromAcc}/ledger`);
+          const finalRes = await fetch(`/accounts/${fromAcc}/ledger`, { headers: authHeaders });
           const finalData = await finalRes.json();
           const finalBalance = finalData.balance_paise;
 
@@ -452,7 +454,7 @@
       // Replay Outbox Event
       const replayEvent = async (id) => {
         try {
-          const res = await fetch(`/outbox/${id}/replay`, { method: 'POST' });
+          const res = await fetch(`/outbox/${id}/replay`, { method: 'POST', headers: authHeaders });
           const data = await res.json();
           if (res.ok) {
             showToast('Event reset to PENDING for immediate redelivery', 'success');

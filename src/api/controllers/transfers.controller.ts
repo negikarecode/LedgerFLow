@@ -3,13 +3,16 @@ import { v4 as uuidv4 } from 'uuid';
 import { getClient } from '../../db/pool';
 import { redis } from '../../redis/client';
 
+const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
+
 export async function createTransfer(
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  const { from_account_id, to_account_id, amount_paise, webhook_url } = req.body;
+  const { from_account_id, to_account_id, amount_paise } = req.body;
   const idempotency = req.idempotency;
+  const merchantId = req.merchant?.id || idempotency?.merchantId || DEFAULT_DEMO_MERCHANT_ID;
 
   const client = await getClient();
 
@@ -17,14 +20,16 @@ export async function createTransfer(
     await client.query('BEGIN');
 
     // 1. Deadlock-free locking: Sort IDs alphabetically before SELECT FOR UPDATE
+    // CRITICAL: Both accounts must belong to the authenticated merchant.
+    // If one or both are missing or belong to another merchant, return 404 (never 403).
     const [firstId, secondId] = [from_account_id, to_account_id].sort();
     const lockQuery = `
-      SELECT id 
+      SELECT id, merchant_id 
       FROM accounts 
-      WHERE id IN ($1, $2) 
+      WHERE id IN ($1, $2) AND merchant_id = $3
       ORDER BY id FOR UPDATE;
     `;
-    const lockResult = await client.query(lockQuery, [firstId, secondId]);
+    const lockResult = await client.query(lockQuery, [firstId, secondId, merchantId]);
 
     if (lockResult.rows.length < 2) {
       await client.query('ROLLBACK');
@@ -77,29 +82,42 @@ export async function createTransfer(
 
     const createdAt = ledgerResult.rows[0].created_at;
 
-    // 4. If webhook_url is provided, insert PENDING event into outbox_events
-    let outboxEventId: string | null = null;
-    if (webhook_url) {
-      const outboxPayload = {
-        event: 'transfer.completed',
-        transaction_id: transactionId,
-        from_account_id,
-        to_account_id,
-        amount_paise,
-        created_at: createdAt,
-      };
+    // 4. Create one outbox_events row per ACTIVE endpoint of that merchant subscribed to 'transfer.completed'
+    // inside the same transaction as the ledger entries.
+    const endpointQuery = `
+      SELECT id, url, secret
+      FROM webhook_endpoints
+      WHERE merchant_id = $1
+        AND status = 'ACTIVE'
+        AND 'transfer.completed' = ANY(event_types);
+    `;
+    const endpointResult = await client.query(endpointQuery, [merchantId]);
 
+    const outboxPayload = {
+      event: 'transfer.completed',
+      transaction_id: transactionId,
+      from_account_id,
+      to_account_id,
+      amount_paise,
+      created_at: createdAt,
+    };
+
+    const outboxEventIds: string[] = [];
+
+    for (const ep of endpointResult.rows) {
       const outboxInsertQuery = `
-        INSERT INTO outbox_events (event_type, payload, target_url, status)
-        VALUES ($1, $2, $3, 'PENDING')
+        INSERT INTO outbox_events (event_type, payload, target_url, status, merchant_id, endpoint_id)
+        VALUES ($1, $2, $3, 'PENDING', $4, $5)
         RETURNING id;
       `;
       const outboxResult = await client.query(outboxInsertQuery, [
         'transfer.completed',
         JSON.stringify(outboxPayload),
-        webhook_url,
+        ep.url,
+        merchantId,
+        ep.id,
       ]);
-      outboxEventId = outboxResult.rows[0].id;
+      outboxEventIds.push(outboxResult.rows[0].id);
     }
 
     // 5. Build response body
@@ -109,23 +127,24 @@ export async function createTransfer(
       to_account_id,
       amount_paise,
       status: 'COMPLETED',
-      webhook_url: webhook_url || null,
-      outbox_event_id: outboxEventId,
+      outbox_event_id: outboxEventIds[0] || null,
+      outbox_event_ids: outboxEventIds,
       created_at: createdAt,
     };
 
-    // 6. Save the 201 response in idempotency_keys inside the SAME transaction
+    // 6. Save the 201 response in idempotency_keys inside the SAME transaction namespaced by merchant_id
     if (idempotency) {
       const idempotencyInsertQuery = `
-        INSERT INTO idempotency_keys (key, request_hash, response_status, response_body)
-        VALUES ($1, $2, 201, $3)
-        ON CONFLICT (key) DO UPDATE SET
+        INSERT INTO idempotency_keys (key, merchant_id, request_hash, response_status, response_body)
+        VALUES ($1, $2, $3, 201, $4)
+        ON CONFLICT (merchant_id, key) DO UPDATE SET
           request_hash = EXCLUDED.request_hash,
           response_status = EXCLUDED.response_status,
           response_body = EXCLUDED.response_body;
       `;
       await client.query(idempotencyInsertQuery, [
         idempotency.key,
+        merchantId,
         idempotency.requestHash,
         JSON.stringify(responseBody),
       ]);

@@ -1,26 +1,30 @@
 import { Request, Response, NextFunction } from 'express';
 import { query } from '../../db/pool';
 
+const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
+
 export async function listOutboxEvents(
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
   try {
+    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
     const limit = Math.min(Number(req.query.limit) || 50, 100);
     const offset = Math.max(Number(req.query.offset) || 0, 0);
     const status = req.query.status as string | undefined;
 
     let sql = `
-      SELECT id, event_type, payload, target_url, status, attempts, next_retry_at, created_at
+      SELECT id, merchant_id, event_type, payload, target_url, status, attempts, next_retry_at, created_at
       FROM outbox_events
+      WHERE merchant_id = $1
     `;
-    let countSql = `SELECT COUNT(*)::INT AS total FROM outbox_events`;
-    const params: any[] = [];
+    let countSql = `SELECT COUNT(*)::INT AS total FROM outbox_events WHERE merchant_id = $1`;
+    const params: any[] = [merchantId];
 
     if (status) {
-      sql += ` WHERE status = $1`;
-      countSql += ` WHERE status = $1`;
+      sql += ` AND status = $2`;
+      countSql += ` AND status = $2`;
       params.push(status);
     }
 
@@ -28,12 +32,13 @@ export async function listOutboxEvents(
 
     const [eventsResult, countResult] = await Promise.all([
       query(sql, [...params, limit, offset]),
-      query(countSql, status ? [status] : []),
+      query(countSql, status ? [merchantId, status] : [merchantId]),
     ]);
 
     res.status(200).json({
       data: eventsResult.rows.map((row) => ({
         id: row.id,
+        merchant_id: row.merchant_id,
         event_type: row.event_type,
         payload: row.payload,
         target_url: row.target_url,
@@ -60,10 +65,12 @@ export async function replayOutboxEvent(
 ): Promise<void> {
   try {
     const { id } = req.params;
+    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
 
+    // Check ownership by merchant (returns 404 for non-existent or foreign events)
     const checkResult = await query(
-      `SELECT id, status FROM outbox_events WHERE id = $1`,
-      [id]
+      `SELECT id, status FROM outbox_events WHERE id = $1 AND merchant_id = $2`,
+      [id, merchantId]
     );
 
     if (checkResult.rows.length === 0) {
@@ -77,9 +84,9 @@ export async function replayOutboxEvent(
     const updateResult = await query(
       `UPDATE outbox_events 
        SET status = 'PENDING', attempts = 0, next_retry_at = NOW() 
-       WHERE id = $1 
-       RETURNING id, event_type, payload, target_url, status, attempts, next_retry_at, created_at`,
-      [id]
+       WHERE id = $1 AND merchant_id = $2
+       RETURNING id, merchant_id, event_type, payload, target_url, status, attempts, next_retry_at, created_at`,
+      [id, merchantId]
     );
 
     const updated = updateResult.rows[0];
@@ -88,6 +95,7 @@ export async function replayOutboxEvent(
       message: 'Outbox event reset to PENDING for immediate redelivery',
       event: {
         id: updated.id,
+        merchant_id: updated.merchant_id,
         event_type: updated.event_type,
         payload: updated.payload,
         target_url: updated.target_url,
