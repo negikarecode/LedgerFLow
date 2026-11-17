@@ -17,15 +17,17 @@ export async function createAccount(
     await client.query('BEGIN');
 
     // 1. Insert Account scoped to authenticated merchant
+    const initialPaise = initial_credit_paise && initial_credit_paise > 0 ? initial_credit_paise : 0;
     const accountInsertQuery = `
-      INSERT INTO accounts (owner_name, currency, merchant_id)
-      VALUES ($1, $2, $3)
-      RETURNING id, owner_name, currency, merchant_id, created_at;
+      INSERT INTO accounts (owner_name, currency, merchant_id, balance_paise)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, owner_name, currency, merchant_id, balance_paise, created_at;
     `;
     const accountResult = await client.query(accountInsertQuery, [
       owner_name,
       currency || 'INR',
       merchantId,
+      initialPaise,
     ]);
     const account = accountResult.rows[0];
 
@@ -79,23 +81,15 @@ export async function listAccounts(
 
     const listQuery = `
       SELECT 
-        a.id,
-        a.merchant_id,
-        a.owner_name,
-        a.currency,
-        a.created_at,
-        COALESCE(SUM(
-          CASE 
-            WHEN le.entry_type = 'CREDIT' THEN le.amount
-            WHEN le.entry_type = 'DEBIT' THEN -le.amount
-            ELSE 0
-          END
-        ), 0)::BIGINT AS balance_paise
-      FROM accounts a
-      LEFT JOIN ledger_entries le ON a.id = le.account_id
-      WHERE a.merchant_id = $1
-      GROUP BY a.id, a.merchant_id, a.owner_name, a.currency, a.created_at
-      ORDER BY a.created_at DESC
+        id,
+        merchant_id,
+        owner_name,
+        currency,
+        balance_paise,
+        created_at
+      FROM accounts
+      WHERE merchant_id = $1
+      ORDER BY created_at DESC
       LIMIT $2 OFFSET $3;
     `;
 
@@ -135,22 +129,14 @@ export async function getAccountById(
 
     const accountQuery = `
       SELECT 
-        a.id,
-        a.merchant_id,
-        a.owner_name,
-        a.currency,
-        a.created_at,
-        COALESCE(SUM(
-          CASE 
-            WHEN le.entry_type = 'CREDIT' THEN le.amount
-            WHEN le.entry_type = 'DEBIT' THEN -le.amount
-            ELSE 0
-          END
-        ), 0)::BIGINT AS balance_paise
-      FROM accounts a
-      LEFT JOIN ledger_entries le ON a.id = le.account_id
-      WHERE a.id = $1 AND a.merchant_id = $2
-      GROUP BY a.id, a.merchant_id, a.owner_name, a.currency, a.created_at;
+        id,
+        merchant_id,
+        owner_name,
+        currency,
+        balance_paise,
+        created_at
+      FROM accounts
+      WHERE id = $1 AND merchant_id = $2;
     `;
 
     const accountResult = await query(accountQuery, [id, merchantId]);
@@ -203,7 +189,7 @@ export async function getAccountLedger(
     const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
 
     const accountQuery = `
-      SELECT id, merchant_id, owner_name, currency, created_at 
+      SELECT id, merchant_id, owner_name, currency, balance_paise, created_at 
       FROM accounts 
       WHERE id = $1 AND merchant_id = $2;
     `;
@@ -218,19 +204,6 @@ export async function getAccountLedger(
       return;
     }
 
-    const balanceQuery = `
-      SELECT COALESCE(SUM(
-        CASE 
-          WHEN entry_type = 'CREDIT' THEN amount
-          WHEN entry_type = 'DEBIT' THEN -amount
-          ELSE 0
-        END
-      ), 0)::BIGINT AS balance_paise
-      FROM ledger_entries
-      WHERE account_id = $1;
-    `;
-    const balanceResult = await query(balanceQuery, [id]);
-
     const entriesQuery = `
       SELECT id, transaction_id, account_id, entry_type, amount, created_at
       FROM ledger_entries
@@ -241,12 +214,23 @@ export async function getAccountLedger(
 
     const account = accountResult.rows[0];
 
+    let balancePaise =
+      account.balance_paise !== null && account.balance_paise !== undefined
+        ? Number(account.balance_paise)
+        : null;
+
+    if (balancePaise === null || isNaN(balancePaise)) {
+      balancePaise = entriesResult.rows.reduce((sum, e) => {
+        return sum + (e.entry_type === 'CREDIT' ? Number(e.amount) : -Number(e.amount));
+      }, 0);
+    }
+
     res.status(200).json({
       account_id: account.id,
       merchant_id: account.merchant_id,
       owner_name: account.owner_name,
       currency: account.currency,
-      balance_paise: Number(balanceResult.rows[0].balance_paise),
+      balance_paise: balancePaise,
       created_at: account.created_at,
       ledger_entries: entriesResult.rows.map((entry) => ({
         id: entry.id,

@@ -4,6 +4,7 @@ import {
   createMerchant,
   createMerchantKey,
   revokeApiKey,
+  handleAdminReconcile,
 } from '../controllers/admin.controller';
 
 export const adminRouter = Router();
@@ -14,3 +15,4 @@ adminRouter.use('/admin', requireAdminToken);
 adminRouter.post('/admin/merchants', createMerchant);
 adminRouter.post('/admin/merchants/:id/keys', createMerchantKey);
 adminRouter.post('/admin/keys/:id/revoke', revokeApiKey);
+adminRouter.post('/admin/reconcile', handleAdminReconcile);

@@ -157,3 +157,23 @@ export async function revokeApiKey(
     next(err);
   }
 }
+
+/**
+ * Admin Reconciliation Trigger:
+ * Compares all accounts' cached balance_paise against SUM of ledger_entries,
+ * and double-entry balance conservation across all transfers.
+ */
+export async function handleAdminReconcile(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const autoRepair = req.body?.auto_repair === true;
+    const { reconcileAccountBalances } = await import('../../services/reconciliation');
+    const report = await reconcileAccountBalances({ autoRepair });
+    res.status(200).json(report);
+  } catch (err) {
+    next(err);
+  }
+}

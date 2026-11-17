@@ -50,7 +50,7 @@ export function getWebhookQueue(): Queue<WebhookDeliveryPayload> {
  * Polls eligible PENDING outbox events using fair endpoint partitioning
  * with FOR UPDATE SKIP LOCKED and enqueues them into BullMQ.
  */
-export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number> {
+export async function pollAndEnqueueOutboxEvents(batchSize = 100): Promise<number> {
   const client = await getClient();
   const queue = getWebhookQueue();
 
@@ -448,13 +448,18 @@ export function startWebhookWorker(): {
 
   const runPoller = async () => {
     if (!pollerRunning) return;
+    let nextDelay = 1000;
     try {
-      await pollAndEnqueueOutboxEvents();
+      const enqueued = await pollAndEnqueueOutboxEvents(100);
+      // Adaptive backoff: if events were enqueued, poll immediately (50ms) to drain backlog without latency
+      if (enqueued > 0) {
+        nextDelay = 50;
+      }
     } catch (err: any) {
       console.error('[Outbox Poller] Error during poll cycle:', err.message);
     }
     if (pollerRunning) {
-      pollerTimeout = setTimeout(runPoller, 1000);
+      pollerTimeout = setTimeout(runPoller, nextDelay);
     }
   };
 

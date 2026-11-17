@@ -44,6 +44,8 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ledgerflow}
       REDIS_URL: redis://redis:6379
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-default-ledgerflow-secret-key-12345}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-default-admin-token-secret-99999}
+      ALLOW_PRIVATE_WEBHOOK_TARGETS: ${ALLOW_PRIVATE_WEBHOOK_TARGETS:-true}
     ports:
       - "${PORT:-3000}:3000"
     volumes:
@@ -68,6 +70,8 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ledgerflow}
       REDIS_URL: redis://redis:6379
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-default-ledgerflow-secret-key-12345}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-default-admin-token-secret-99999}
+      ALLOW_PRIVATE_WEBHOOK_TARGETS: ${ALLOW_PRIVATE_WEBHOOK_TARGETS:-true}
     volumes:
       - ./src:/app/src
       - /app/node_modules

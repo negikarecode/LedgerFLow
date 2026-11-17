@@ -37,8 +37,8 @@ describe('LedgerFlow Observability & Metrics Suite', () => {
     bobId = uuidv4();
 
     await pool.query(
-      `INSERT INTO accounts (id, merchant_id, owner_name, currency) 
-       VALUES ($1, $2, $3, $4), ($5, $2, $6, $4)
+      `INSERT INTO accounts (id, merchant_id, owner_name, currency, balance_paise) 
+       VALUES ($1, $2, $3, $4, 50000), ($5, $2, $6, $4, 0)
        ON CONFLICT (id) DO NOTHING`,
       [aliceId, DEMO_MERCHANT_ID, 'Alice Metric', 'INR', bobId, 'Bob Metric']
     );

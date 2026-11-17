@@ -18,8 +18,10 @@ const envSchema = z.object({
   ALLOW_PRIVATE_WEBHOOK_TARGETS: z
     .string()
     .optional()
-    .default('false')
-    .transform((val) => val === 'true'),
+    .transform((val) => {
+      if (val !== undefined) return val === 'true';
+      return process.env.NODE_ENV !== 'production';
+    }),
   IDEMPOTENCY_RETENTION_SECONDS: z.coerce.number().default(86400),
   IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS: z.coerce.number().default(3600),
   CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce.number().default(10),
@@ -30,6 +32,7 @@ const envSchema = z.object({
   WEBHOOK_MAX_CONCURRENT_PER_ENDPOINT: z.coerce.number().default(3),
   WEBHOOK_DELIVERY_TIMEOUT_MS: z.coerce.number().default(5000),
   WEBHOOK_WORKER_CONCURRENCY: z.coerce.number().default(10),
+  DB_POOL_MAX: z.coerce.number().default(60),
 });
 
 export const env = envSchema.parse(process.env);

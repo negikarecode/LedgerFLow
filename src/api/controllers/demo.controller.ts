@@ -59,11 +59,11 @@ export async function resetDemoState(
       ON CONFLICT (id) DO UPDATE SET status = 'ACTIVE';
     `, [DEFAULT_DEMO_MERCHANT_ID]);
 
-    // 3. Seed Alice Sharma
+    // 3. Seed Alice Sharma (100,000 paise / ₹1,000.00)
     const aliceId = uuidv4();
     const aliceTxId = uuidv4();
     await client.query(
-      `INSERT INTO accounts (id, owner_name, currency, merchant_id) VALUES ($1, $2, $3, $4);`,
+      `INSERT INTO accounts (id, owner_name, currency, merchant_id, balance_paise) VALUES ($1, $2, $3, $4, 100000);`,
       [aliceId, 'Alice Sharma', 'INR', DEFAULT_DEMO_MERCHANT_ID]
     );
     await client.query(
@@ -72,11 +72,11 @@ export async function resetDemoState(
       [aliceTxId, aliceId, 100000]
     );
 
-    // 4. Seed Bob Patel
+    // 4. Seed Bob Patel (50,000 paise / ₹500.00)
     const bobId = uuidv4();
     const bobTxId = uuidv4();
     await client.query(
-      `INSERT INTO accounts (id, owner_name, currency, merchant_id) VALUES ($1, $2, $3, $4);`,
+      `INSERT INTO accounts (id, owner_name, currency, merchant_id, balance_paise) VALUES ($1, $2, $3, $4, 50000);`,
       [bobId, 'Bob Patel', 'INR', DEFAULT_DEMO_MERCHANT_ID]
     );
     await client.query(
@@ -101,6 +101,9 @@ export async function resetDemoState(
 
       const concKeys = await redis.keys('concurrency:*');
       if (concKeys.length > 0) keysToDel.push(...concKeys);
+
+      const bullKeys = await redis.keys('bull:webhook-delivery:*');
+      if (bullKeys.length > 0) keysToDel.push(...bullKeys);
 
       if (keysToDel.length > 0) {
         await redis.del(...keysToDel);

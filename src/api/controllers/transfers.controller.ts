@@ -82,7 +82,7 @@ export async function createTransfer(
     // If one or both are missing or belong to another merchant, return 404 (never 403).
     const [firstId, secondId] = [from_account_id, to_account_id].sort();
     const lockQuery = `
-      SELECT id, merchant_id 
+      SELECT id, merchant_id, balance_paise 
       FROM accounts 
       WHERE id IN ($1, $2) AND merchant_id = $3
       ORDER BY id FOR UPDATE;
@@ -99,20 +99,11 @@ export async function createTransfer(
       return;
     }
 
-    // 2. Calculate from_account_id balance from ledger_entries
-    const balanceQuery = `
-      SELECT COALESCE(SUM(
-        CASE 
-          WHEN entry_type = 'CREDIT' THEN amount
-          WHEN entry_type = 'DEBIT' THEN -amount
-          ELSE 0
-        END
-      ), 0)::BIGINT AS balance_paise
-      FROM ledger_entries
-      WHERE account_id = $1;
-    `;
-    const balanceResult = await client.query(balanceQuery, [from_account_id]);
-    const currentBalance = Number(balanceResult.rows[0].balance_paise);
+    const fromAccount = lockResult.rows.find((r) => r.id === from_account_id);
+    const toAccount = lockResult.rows.find((r) => r.id === to_account_id);
+
+    // 2. Instant O(1) balance check from locked row (with DB-level non-negative constraint)
+    const currentBalance = Number(fromAccount.balance_paise);
 
     if (currentBalance < amount_paise) {
       await client.query('ROLLBACK');
@@ -124,7 +115,22 @@ export async function createTransfer(
       return;
     }
 
-    // 3. Insert 2 rows into ledger_entries (DEBIT and CREDIT)
+    // 3. Atomically update cached balance columns under existing row lock
+    const updateBalancesQuery = `
+      UPDATE accounts
+      SET balance_paise = CASE 
+        WHEN id = $1 THEN balance_paise - $3
+        WHEN id = $2 THEN balance_paise + $3
+      END
+      WHERE id IN ($1, $2);
+    `;
+    await client.query(updateBalancesQuery, [
+      from_account_id,
+      to_account_id,
+      amount_paise,
+    ]);
+
+    // 4. Insert 2 rows into immutable ledger_entries (DEBIT and CREDIT)
     const transactionId = uuidv4();
     const ledgerInsertQuery = `
       INSERT INTO ledger_entries (transaction_id, account_id, entry_type, amount)

@@ -8,7 +8,7 @@
 [![Grafana](https://img.shields.io/badge/Grafana-Dashboards-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/features/actions)
-[![Tests](https://img.shields.io/badge/Tests-95%2F95%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Tests-100%2F100%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **LedgerFlow** is an enterprise-grade, multi-tenant, idempotent double-entry financial ledger and webhook delivery engine that guarantees strict balance conservation (0 paise lost or created), zero-overdraft concurrency control, cryptographic API-key multi-tenancy, and at-least-once signed webhook dispatch with automatic crash recovery.
@@ -123,57 +123,54 @@ Open **[http://localhost:3000](http://localhost:3000)** in your browser to exper
 
 ## Benchmarks & Correctness
 
-### 1. 500-Request Concurrency Benchmark
-Run the automated stress harness against the live Docker stack:
+> 📖 **Full Performance Report:** For machine specifications, raw latency percentiles, and bottleneck profiling, see **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
+
+LedgerFlow includes an automated load profiling and stress suite (`npm run benchmark`) testing three distinct concurrency paradigms to provide honest, un-cherry-picked operational numbers:
 
 ```bash
 npm run benchmark
 ```
 
-#### Real Benchmark Results:
-```
-=================================================================================
-               LEDGERFLOW LOAD BENCHMARK & CONCURRENCY SUITE                     
-=================================================================================
-[1/4] Verifying API Server health at http://localhost:3000...
-  ✓ Connected to API Server (PostgreSQL + Redis UP)
+**Benchmarked Machine:** Intel(R) Core(TM) i3-2120 CPU @ 3.30GHz (4 cores), 7.64 GB RAM, Linux x64 (`7.0.0-43-generic`), PostgreSQL 16-alpine (pool max: 60), Redis 7-alpine.
 
-[2/4] Seeding Benchmark Wallets in PostgreSQL...
-  ✓ Account A (Sender)   : 912969a6-ee52-487b-864a-ed62dcdf3512 | Balance: ₹1000.00 (100000 paise)
-  ✓ Account B (Receiver) : b6290e2b-173e-4c9b-b727-f7d5475cbbb4 | Balance: ₹500.00 (50000 paise)
-  ✓ Total Seeded Balance : ₹1500.00 (150000 paise)
-  ✓ Pre-settled 5 transfers to test completed idempotency cache replays
+### 1. Benchmark Scenarios Summary
 
-[3/4] Preparing 500 concurrent transfer requests...
-  ✓ Workload Mix: 350 unique keys + 50 cache replay keys + 100 in-flight duplicate keys
-  ✓ Firing 500 concurrent POST /transfers (Transfer Amount: 1000 paise each)...
+| Scenario | Workload Profile | Throughput | Median (p50) | Tail (p95) | 500 Errors | Mathematical Invariant |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **Hot-Account Contention** | 500 concurrent reqs on **1 account pair** *(Alice $\to$ Bob)* | **62.1 req/s** | 4,839 ms | 7,855 ms | **0** | **$\Delta = 0$ paise** (Verified) |
+| **Realistic (Concurrency 10)** | 100 seeded accounts, random pairs, 80% unique / 15% replay / 5% dup | **58.0 req/s** | 135 ms | 586 ms | **0** | **$\Delta = 0$ paise** (Verified) |
+| **Realistic (Concurrency 25)** | 100 seeded accounts, random pairs, 80% unique / 15% replay / 5% dup | **59.7 req/s** | 406 ms | 794 ms | **0** | **$\Delta = 0$ paise** (Verified) |
+| **Realistic (Concurrency 50)** | 100 seeded accounts, random pairs, 80% unique / 15% replay / 5% dup | **44.4 req/s** | 1,009 ms | 1,987 ms | **0** | **$\Delta = 0$ paise** (Verified) |
 
-[4/4] Verifying Double-Entry Ledger Conservation Invariants...
+> **⚠️ Why is single-pair latency higher?**  
+> In the **Hot-Account Contention** test, all 500 requests target the *exact same* wallet pair. Latency is intentionally dominated by row-lock serialization (`SELECT ... FOR UPDATE`) in PostgreSQL. This is **by design**: locking serializes updates to prevent overdrafts, ensuring **$\Delta = 0$ paise discrepancy**. When traffic distributes across distinct accounts (Scenario 2), lock contention drops dramatically and p50 latency falls to **135 ms**.
 
-=================================================================================
-                          BENCHMARK SUMMARY REPORT                               
-=================================================================================
-┌─────────┬────────────────────────────────┬──────────────────────────────┐
-│ (index) │ Metric                         │ Value                        │
-├─────────┼────────────────────────────────┼──────────────────────────────┤
-│ 0       │ 'Total Requests'               │ '500'                        │
-│ 1       │ 'Requests/sec'                 │ '153.5 req/s'                │
-│ 2       │ 'p50 Latency (ms)'             │ '2517.92 ms'                 │
-│ 3       │ 'p95 Latency (ms)'             │ '2991.86 ms'                 │
-│ 4       │ 'p99 Latency (ms)'             │ '3043.66 ms'                 │
-│ 5       │ '201 Created count'            │ '95'                         │
-│ 6       │ '422 Insufficient Funds count' │ '265'                        │
-│ 7       │ 'X-Idempotent-Replay count'    │ '50'                         │
-│ 8       │ '409 Conflict count'           │ '90'                         │
-│ 9       │ '500 Server Errors count'      │ '0'                          │
-│ 10      │ 'Initial Seeded Sum'           │ '₹1500.00 (150000 paise)'    │
-│ 11      │ 'Final Ledger Sum'             │ '₹1500.00 (150000 paise)'    │
-│ 12      │ 'Net Discrepancy'              │ '0 paise'                    │
-│ 13      │ 'Ledger Audit Status'          │ '✅ 0 paise lost or created' │
-└─────────┴────────────────────────────────┴──────────────────────────────┘
-```
+### 2. Webhook Ingestion & Fault Isolation
 
-### 2. Comprehensive Test Suite (88/88 Passing)
+- **Delivery Lag (Transfer Commit to Receiver Ack):**
+  - **10 events/sec:** 25/25 delivered (100%), p50 lag: 1,048 ms, p95 lag: 2,793 ms
+  - **25 events/sec:** 40/40 delivered (100%), p50 lag: 988 ms, p95 lag: 1,914 ms
+  - **50 events/sec:** 60/60 delivered (100%), p50 lag: 375 ms, p95 lag: 1,244 ms
+- **Fault Isolation (20% Failing Endpoints):**
+  - 5 registered endpoints (4 healthy, 1 returning HTTP 500 crashing mode).
+  - Failing endpoint tripped the distributed circuit breaker to **`OPEN`** after consecutive failures, halting retries without burning worker threads.
+  - **48/48 (100%)** deliveries completed to healthy partners with average lag of **690.7 ms** (**zero queue starvation**).
+
+### 3. Profiled & Implemented Optimizations
+
+1. **Eliminated $O(N)$ Sequential Balance Sums:**
+   - *Previous:* Transfers ran `SELECT COALESCE(SUM(...)) FROM ledger_entries WHERE account_id = $1`, scanning historical entries under lock.
+   - *Fix:* Added cached `balance_paise BIGINT NOT NULL DEFAULT 0` on `accounts` with database constraint `CHECK (balance_paise >= 0)`. Updated in the *same transaction* under `SELECT ... FOR UPDATE` in $O(1)$ time.
+2. **Continuous Balance Reconciliation & Verification:**
+   - Implemented `reconcileAccountBalances()` service and `POST /admin/reconcile` endpoint. Periodically compares `accounts.balance_paise` with the immutable ledger `SUM` and updates Prometheus gauge `ledger_conservation_discrepancy_paise`.
+3. **Database Connection Pool Sizing:**
+   - Increased PostgreSQL pool max to `60` via `DB_POOL_MAX` to support high concurrency.
+4. **Outbox Polling Index Optimization:**
+   - Added partial composite index `idx_outbox_events_pending_polling ON outbox_events(status, next_retry_at, created_at) WHERE status = 'PENDING'`.
+
+---
+
+### 4. Comprehensive Test Suite (100/100 Passing)
 LedgerFlow includes extensive automated integration, concurrency, security, and unit tests using **Vitest** and **Supertest**:
 
 ```bash
@@ -207,6 +204,12 @@ npm test
    ✓ Concurrency: 30s lock expiry with concurrent executors moves funds strictly once (0 double debit)
    ✓ Fault Tolerance: Redis completely unavailable (requests correct via Postgres source of truth)
    ✓ TTL Policy: cleans up records older than retention window (default 24h)
+ ✓ tests/reconciliation.test.ts (5 tests)
+   ✓ Zero Discrepancy: verifies healthy accounts match ledger sum with 0 paise delta
+   ✓ Tamper Detection: detects out-of-sync cached balance and flags discrepancy
+   ✓ Auto-Repair: synchronizes corrupted cache to immutable double-entry ledger SUM
+   ✓ Admin Trigger: POST /admin/reconcile runs authorized reconciliation
+   ✓ Auth Guard: rejects unauthorized calls without ADMIN_TOKEN (401 Unauthorized)
  ✓ tests/worker.test.ts (10 tests)
    ✓ Retry -> Recovery Pipeline: retries on merchant 500, recovers to DELIVERED on 200
  ✓ tests/auth.test.ts (15 tests)
@@ -222,15 +225,18 @@ npm test
    ✓ Stripe-Style Signatures: verifies HMAC-SHA256 (t=...,v1=...) & rejects stale timestamps
    ✓ Endpoints CRUD: registers, lists, deletes endpoints & rotates secrets securely
    ✓ Fan-Out Outbox: automatically generates outbox event per active registered endpoint on transfer
+ ✓ tests/observability.test.ts (7 tests)
+   ✓ Prometheus Metrics: GET /metrics exposes duration histograms, outbox depth, breaker gauges
+   ✓ Trace Propagation: propagates X-Request-Id from API to outbox event to worker delivery attempt
  ✓ tests/api.test.ts (12 tests)
    ✓ Accounts & Ledger balance calculation (BIGINT paise)
  ✓ tests/transfers.test.ts (11 tests)
    ✓ Race-Condition Stress: 50 concurrent transfers; zero overdraft guarantee
    ✓ Deadlock Prevention: opposite-direction transfers (A->B and B->A); zero PostgreSQL deadlocks
 
- Test Files  8 passed (8)
-      Tests  88 passed (88)
-   Duration  28.27s
+ Test Files  10 passed (10)
+      Tests  100 passed (100)
+   Duration  41.69s
 ```
 
 ---

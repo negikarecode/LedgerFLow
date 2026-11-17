@@ -194,18 +194,30 @@ export async function updateSystemMetrics(): Promise<void> {
     }
   } catch {}
 
-  // 4. Double-Entry Balance Conservation Invariant
-  // For all transfer transactions (where a DEBIT entry exists),
-  // total debits must mathematically equal total credits.
+  // 4. Double-Entry Balance Conservation & Account Cache Consistency Invariant
+  // For all transfer transactions (where a DEBIT entry exists), total debits must mathematically
+  // equal total credits, AND all account balance_paise must strictly match the ledger SUM.
   try {
     const auditRes = await query(`
-      SELECT COALESCE(
-        SUM(CASE WHEN entry_type = 'DEBIT' THEN amount ELSE 0 END) -
-        SUM(CASE WHEN entry_type = 'CREDIT' AND transaction_id IN (
-          SELECT transaction_id FROM ledger_entries WHERE entry_type = 'DEBIT'
-        ) THEN amount ELSE 0 END), 0
+      SELECT (
+        COALESCE((
+          SELECT SUM(CASE WHEN entry_type = 'DEBIT' THEN amount ELSE 0 END) -
+                 SUM(CASE WHEN entry_type = 'CREDIT' AND transaction_id IN (
+                   SELECT transaction_id FROM ledger_entries WHERE entry_type = 'DEBIT'
+                 ) THEN amount ELSE 0 END)
+          FROM ledger_entries
+        ), 0) +
+        COALESCE((
+          SELECT SUM(ABS(a.balance_paise - COALESCE(s.computed, 0)))
+          FROM accounts a
+          LEFT JOIN (
+            SELECT account_id, SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE -amount END) AS computed
+            FROM ledger_entries 
+            GROUP BY account_id
+          ) s ON a.id = s.account_id
+          WHERE a.balance_paise != COALESCE(s.computed, 0)
+        ), 0)
       )::BIGINT AS discrepancy_paise
-      FROM ledger_entries
     `);
     const discrepancy = Number(auditRes.rows[0]?.discrepancy_paise || 0);
     ledgerConservationDiscrepancyPaise.set(discrepancy);
