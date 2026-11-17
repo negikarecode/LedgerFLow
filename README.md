@@ -11,7 +11,17 @@
 [![Tests](https://img.shields.io/badge/Tests-100%2F100%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **LedgerFlow** is an enterprise-grade, multi-tenant, idempotent double-entry financial ledger and webhook delivery engine that guarantees strict balance conservation (0 paise lost or created), zero-overdraft concurrency control, cryptographic API-key multi-tenancy, and at-least-once signed webhook dispatch with automatic crash recovery.
+> **LedgerFlow** is an enterprise-grade, multi-tenant financial ledger and webhook delivery engine that guarantees mathematically strict double-entry balance conservation ($\Delta = 0$ paise lost or created), zero-overdraft concurrency control, cryptographic API-key tenant isolation, and at-least-once signed webhook dispatch. Built with TypeScript, PostgreSQL 16, and Redis 7, LedgerFlow decouples synchronous money movement from asynchronous partner notifications using the Transactional Outbox Pattern, an ACID-backed multi-tier idempotency guard, and distributed per-endpoint circuit breakers that isolate downstream failures without queue starvation.
+
+![LedgerFlow Chaos Simulator Demo](docs/images/demo.gif)
+*Interactive Mission Control: Live Double-Entry Ledger, Chaos Stress Engine, and Real-Time Webhook Outbox.*
+
+---
+
+## Key Documentation
+
+- 📊 **[docs/BENCHMARKS.md](docs/BENCHMARKS.md):** Comprehensive multi-account load profile, lock serialization analysis, and delivery lag benchmarks.
+- 🛡️ **[docs/FAILURE_MODES.md](docs/FAILURE_MODES.md):** In-depth code-level analysis of 8 catastrophic failure scenarios, formal guarantees, and recovery protocols.
 
 ---
 
@@ -39,6 +49,72 @@ flowchart LR
     SSRF -->|8. POST payload + HMAC signature (event_id, delivery_id)| Merchant
     Worker -->|9. Record delivery_attempt & update breaker state| Postgres
 ```
+
+---
+
+## Design Decisions & Tradeoffs
+
+Architecting a financial ledger and asynchronous webhook pipeline requires balancing strict ACID consistency against operational latency and throughput. Below are the core architectural decisions, deliberate tradeoffs, and scaling evolutions designed into LedgerFlow.
+
+### 1. Why the Transactional Outbox Pattern?
+- **The Dual-Write Problem:** In distributed systems, updating a database and publishing an event (or calling a third-party HTTP endpoint) in the same handler creates an unresolvable dual-write hazard. If the database commit succeeds but the network call fails, the partner never receives the event. If the network call succeeds but the database transaction subsequently fails (due to an overdraft or connection drop), the partner receives a phantom transfer notification. Distributed two-phase commit (2PC) protocols across HTTP boundaries are notoriously fragile and introduce severe latency penalties.
+- **The LedgerFlow Guarantee:** LedgerFlow writes outbox events inside the **exact same ACID transaction** as the double-entry `ledger_entries` and `accounts.balance_paise` updates. The database commit guarantees that either both the ledger update and the outbox records persist atomically, or neither does. A decoupled background worker polls and dispatches these events asynchronously with guaranteed at-least-once delivery.
+
+### 2. Why Redis Plus PostgreSQL for Idempotency?
+- **Why Not Pure Redis?**
+  Redis is an in-memory datastore subject to evictions, memory exhaustion, network partitions, and node restarts. If Redis crashes mid-flight or flushes, all active lock keys and replay caches vanish. If idempotency relied exclusively on Redis, concurrent retries after a restart could double-execute transfers. Furthermore, Redis lock TTLs (e.g. 30 seconds) mean a long-running database transaction could outlive its lock, permitting a concurrent duplicate request to slip through.
+- **Why Not Pure PostgreSQL?**
+  Relying solely on PostgreSQL forces every single API request—including rapid client double-clicks and repeated polling replays—to perform disk I/O, row locks, and write transactions on an `idempotency_keys` table. Under high concurrency, this causes table bloat, lock contention, and high CPU utilization for read-only idempotent replays that should be answered in sub-millisecond time.
+- **The Hybrid Architecture:**
+  - **Redis as Fast-Path Mutex & Cache:** Redis provides sub-millisecond mutex locking (`SET idemp:<merchant_id>:<key> <token> EX 30 NX`) and an instant in-memory replay cache. Sibling requests arriving while a transaction is in-flight receive an instant HTTP `409 Conflict` in <1ms without touching PostgreSQL.
+  - **PostgreSQL as Durable Source of Truth:** Correctness *never* relies on Redis. At transaction start, LedgerFlow executes `INSERT INTO idempotency_keys ... ON CONFLICT (merchant_id, key) DO UPDATE ... RETURNING ...` under a PostgreSQL `PRIMARY KEY (merchant_id, key)` constraint. If Redis is down, fails over, or lock keys expire prematurely, concurrent transactions serialize on PostgreSQL row locks: the second transaction waits for the first to commit, reads the committed HTTP 201 response, and returns the idempotent replay without moving funds. Redis is a latency optimization; PostgreSQL is the invariant guarantee.
+
+### 3. Why BullMQ for Webhook Worker Orchestration?
+- **Worker Coordination & Concurrency:** BullMQ provides battle-tested job queuing on top of Redis streams and hashes. It delivers worker concurrency pooling, delayed retry scheduling with exponential backoff and jitter, worker heartbeat monitoring, and clean shutdown hooks without introducing the operational complexity of heavyweight distributed brokers (like Apache Kafka or RabbitMQ) for single-cluster deployments.
+- **Paired with Fair PostgreSQL Partition Polling:** Pure Redis queues lack native multi-tenant fairness: a single merchant generating thousands of transfers or a failing endpoint clogging retry queues could monopolize BullMQ worker threads. LedgerFlow pairs BullMQ with a fair outbox poller running `ROW_NUMBER() OVER (PARTITION BY endpoint_id ORDER BY created_at ASC) <= 5`, ensuring events across heterogeneous endpoints are interleaved fairly before being handed to BullMQ.
+
+### 4. What Would Change at 100x Scale? (e.g., 50,000+ transfers/sec)
+At 100x scale (tens of thousands of concurrent transfers per second across hundreds of thousands of merchants):
+1. **WAL-Based Change Data Capture (CDC) via Debezium & Kafka:** Polling PostgreSQL with `SELECT ... FOR UPDATE SKIP LOCKED` introduces read amplification, table churn, and autovacuum overhead at 50,000 events/sec. At scale, the transactional outbox table is read via PostgreSQL Write-Ahead Log (WAL) replication slots using Debezium, streaming event mutations directly into Apache Kafka or Apache Pulsar partitioned by `endpoint_id`.
+2. **Horizontal Tenant Sharding:** Because LedgerFlow enforces strict multi-tenancy and all transfers occur between accounts of the *same* merchant, database tables (`accounts`, `ledger_entries`, `idempotency_keys`) can be sharded horizontally across independent PostgreSQL clusters using `merchant_id` as the shard key, achieving linear horizontal scalability without cross-shard distributed transactions.
+3. **Read/Write Splitting & Connection Pooling:** Deploy PgBouncer in transaction pooling mode alongside read replicas for balance statements (`GET /accounts/:id/ledger`), historical attempt queries (`GET /outbox/:id`), and continuous reconciliation jobs, isolating write transactions on the primary cluster.
+4. **Dedicated Webhook Egress Gateway:** Move webhook HTTP dispatchers to an isolated Kubernetes egress node pool with egress proxies (Envoy / Squid) to strictly enforce network policies, IP pinning, and prevent outbound socket/port exhaustion on the main API and worker clusters.
+
+---
+
+## Security
+
+LedgerFlow treats security as a foundational architectural invariant, protecting against multi-tenant data leakage, Server-Side Request Forgery (SSRF), replay attacks, and side-channel timing attacks.
+
+### 1. Multi-Tenant Authentication & Key Lifecycle
+- **Tenant Isolation:** Every financial account, ledger entry, outbox event, and delivery attempt is cryptographically bound to a `merchant_id`. Cross-tenant queries return HTTP `404 Not Found` (never `403 Forbidden`) to prevent resource existence enumeration.
+- **Cryptographic Key Format:** API keys are generated with high entropy: `lf_live_<32 bytes base64url>`.
+- **Zero Raw Key Storage:** Keys are SHA-256 hashed at rest (`key_hash`). Only a short 8-character prefix (`key_prefix`) is stored in plaintext for fast indexed lookup. The plaintext key is displayed to the administrator **strictly once** upon generation and can never be retrieved from the database.
+- **Timing Attack Resistance:** Key authentication middleware (`requireApiKey`) and administrative token validation compare hashes using constant-time string comparisons via Node.js `crypto.timingSafeEqual` to prevent side-channel timing attacks.
+- **Admin Bootstrap Protocol:** Tenant creation and key issuance are gated behind `POST /admin/merchants`, authenticated via an `ADMIN_TOKEN` secret.
+
+### 2. Enterprise-Grade SSRF Defense Engine
+To protect internal cloud infrastructure and cloud metadata services from malicious or misconfigured webhook destinations (`src/security/ssrf.ts`):
+- **Comprehensive CIDR Filtering:** Blocks all private, loopback, link-local, and reserved IP ranges:
+  - IPv4: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`
+  - Carrier-Grade NAT (CGNAT): `100.64.0.0/10`
+  - Cloud Instance Metadata: `169.254.169.254` (AWS, Google Cloud, Azure, Oracle Cloud metadata services)
+  - IPv6: `::1/128`, `fc00::/7` (ULA), `fe80::/10` (link-local)
+- **DNS Rebinding Prevention & IP Pinning:** Standard HTTP clients resolve DNS at request time, which attackers exploit via DNS rebinding (returning a public IP during registration, and resolving to `127.0.0.1` or `169.254.169.254` on subsequent requests). LedgerFlow resolves hostnames before dispatch, verifies the resolved IP against the CIDR filter, and pins the socket directly to the validated IP using a custom `http.Agent`/`https.Agent` `lookup` callback.
+- **Hop-by-Hop Redirect Inspection:** HTTP 301, 302, 307, and 308 redirects are intercepted manually (up to 3 hops). Each redirect target URL undergoes full DNS resolution and CIDR filtering before following the redirect.
+- **Timeout & Payload Protection:** Hard 5-second socket timeout (`WEBHOOK_DELIVERY_TIMEOUT_MS`) and a strict 64 KB response body buffer limit to prevent Slowloris attacks and memory exhaustion.
+- **Production Guard:** Enforces `https://` protocol in production environments (`ALLOW_PRIVATE_WEBHOOK_TARGETS=false`).
+
+### 3. Secret Management & Stripe-Style Webhook Signatures
+- **Endpoint Signing Secrets:** Each registered webhook endpoint is assigned a cryptographically random secret (`whsec_<64 hex chars>`). Secrets are stored securely, masked in UI and API listings, and rotatable on demand (`POST /webhook-endpoints/:id/rotate-secret`).
+- **Signature Construction:** Webhooks include an `X-LedgerFlow-Signature` header formatted as:
+  ```
+  X-LedgerFlow-Signature: t=1731850000,v1=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+  ```
+  The signature is computed as `HMAC-SHA256(secret, "${t}.${payload}")`.
+- **Replay Attack Mitigation:** Receivers must extract `t`, compute the HMAC over `${t}.${payload}`, compare signatures using constant-time comparison, and verify that `Math.abs(Date.now() / 1000 - t) <= 300` seconds. Any request outside this 5-minute tolerance window is rejected, completely neutralizing replay attacks even if payloads are intercepted.
+
+---
 
 ---
 
@@ -243,15 +319,7 @@ npm test
 
 ## Core Engineering Principles
 
-### 1. Multi-Tenant Architecture & Cryptographic API Keys
-LedgerFlow implements secure multi-tenancy with strict cryptographic guarantees:
-- **API Key Format:** `lf_live_<random 32+ bytes base64url>`.
-- **Zero Raw Key Storage:** Keys are SHA-256 hashed at rest. The full raw key is revealed **strictly once** at creation time.
-- **Timing Attack Defense:** All key and admin token comparisons execute in constant time via Node.js `crypto.timingSafeEqual`.
-- **Information Leakage Prevention:** Any attempt by a tenant to query, read, or transfer to/from a foreign tenant's account returns HTTP `404 Not Found` (never `403 Forbidden`), completely eliminating resource enumeration vulnerabilities.
-- **Tenant-Namespaced Idempotency:** Redis locking (`idemp:<merchant_id>:<key>`) and PostgreSQL durable constraints (`PRIMARY KEY (merchant_id, key)`) ensure that two different merchants using identical idempotency keys will never collide or cross-contaminate.
-
-### 2. Integer-Only Accounting (Paise, Not Floats)
+### 1. Integer-Only Accounting (Paise, Not Floats)
 IEEE 754 floating-point arithmetic causes rounding errors (`0.1 + 0.2 === 0.30000000000000004`). LedgerFlow stores all amounts strictly as 64-bit integers (`BIGINT`) representing **paise** (1 INR = 100 paise; e.g. ₹500.25 = 50,025 paise). Balance calculations utilize SQL `SUM()` aggregations over immutable `CREDIT` and `DEBIT` entries.
 
 ### 2. Deadlock-Free Concurrency Control
@@ -292,20 +360,7 @@ Dual-write problems occur when an API writes to a database and publishes an even
 - A dedicated background worker consumes pending outbox events using BullMQ, dispatches HTTP POST requests to merchant endpoints, and attaches cryptographic signatures.
 - Upstream outages trigger exponential backoff retries (`2s, 4s, 8s, 16s...`) before dead-letter routing.
 
-### 5. Multi-Layer SSRF Defense & Stripe-Style Webhook Signatures
-Webhooks dispatched to arbitrary partner URLs present severe Server-Side Request Forgery (SSRF) and replay risks:
-- **Dedicated SSRF Engine (`src/security/ssrf.ts`):**
-  - **Comprehensive CIDR Filtering:** Blocks private IPv4 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`), CGNAT (`100.64.0.0/10`), IPv6 loopback/ULA/link-local (`::1`, `fc00::/7`, `fe80::/10`), and cloud provider metadata services (`169.254.169.254` on AWS, GCP, Azure).
-  - **DNS Rebinding Protection:** Resolves hostnames via DNS and pins the validated IP address at connection time using a custom HTTP/HTTPS `Agent` `lookup` callback, ensuring the socket connects exclusively to the verified IP.
-  - **Hop-by-Hop Redirect Validation:** Re-resolves and inspects every redirect hop (up to 3 hops), immediately terminating any request redirecting to private or loopback addresses.
-  - **Hard Timeouts & Size Caps:** 5-second socket timeout and 64 KB response size cap to prevent slowloris or denial-of-service memory exhaustion.
-  - **Production Guard:** Enforces `https://` in production; supports `ALLOW_PRIVATE_WEBHOOK_TARGETS=true` for local development and Docker demo suites.
-- **Stripe-Style Webhook Signatures:**
-  - Each endpoint is assigned a secret (`whsec_<64 hex bytes>`), revealed strictly once at creation and rotatable on demand.
-  - Headers contain `X-LedgerFlow-Signature: t=<unix_timestamp>,v1=<hmac_sha256>`.
-  - Receivers verify HMAC over `${t}.${payload}` and reject timestamps older than tolerance (e.g. 300s) to completely defeat replay attacks.
-
-### 6. Delivery Attempt Audit Log & Receiver Deduplication (`event_id` / `delivery_id`)
+### 5. Delivery Attempt Audit Log & Receiver Deduplication (`event_id` / `delivery_id`)
 Reliable webhook integration requires full visibility into delivery failures and safe replay semantics:
 - **Granular Attempt Audit Trail (`delivery_attempts` table):**
   - Every individual HTTP dispatch logs an immutable row: `outbox_event_id`, `attempt_number`, `started_at`, execution `duration_ms`, `http_status` (or `null` on network errors/timeouts), `request_signature`, `next_retry_at`, and an `error_message` snippet capped at 1 KB.
@@ -318,7 +373,7 @@ Reliable webhook integration requires full visibility into delivery failures and
 - **Visual Mission Control:**
   - Interactive dashboard includes a live **Delivery Log** panel displaying attempt timelines, durations, HTTP response codes, error body snippets, and 1-click single or batch replay buttons.
 
-### 7. Per-Endpoint Isolation, Distributed Circuit Breaker & Rate Limiter
+### 6. Per-Endpoint Isolation, Distributed Circuit Breaker & Rate Limiter
 A single failing, slow, or malicious merchant endpoint must never degrade performance or monopolize worker queues for healthy partners:
 - **Per-Endpoint Distributed Circuit Breaker (`CLOSED` / `OPEN` / `HALF_OPEN`):**
   - **Shared Redis State with Durable PostgreSQL Fallback:** Tracks real-time failure state across horizontally scaled workers (`cb:endpoint:<id>`), falling back to PostgreSQL `webhook_endpoints` if Redis is degraded.
@@ -336,7 +391,7 @@ A single failing, slow, or malicious merchant endpoint must never degrade perfor
 - **Before/After Verification:**
   - Run `npm run demo:isolation` to execute the automated before/after demonstration comparing queue behavior and zero worker starvation.
 
-### 8. Enterprise Observability, Prometheus Metrics & Distributed Tracing
+### 7. Enterprise Observability, Prometheus Metrics & Distributed Tracing
 LedgerFlow provides comprehensive, production-grade observability covering API latencies, queue dynamics, circuit breaker state, PostgreSQL pool health, and continuous double-entry mathematical conservation invariants.
 
 ![LedgerFlow Production & Observability Overview](docs/images/grafana-dashboard.png)
@@ -403,7 +458,7 @@ LedgerFlow includes an automated CI pipeline defined in [`.github/workflows/ci.y
   2. `tsc --noEmit` (strict TypeScript type verification)
   3. `npm run migrate` (applies schema migrations)
   4. `npm run build` (builds production artifacts)
-  5. `npm test` (executes 95 Vitest integration test cases)
+  5. `npm test` (executes 100 Vitest integration test cases)
 
 ---
 
