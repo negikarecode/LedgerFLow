@@ -48,7 +48,7 @@ export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number
         AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
       ORDER BY o.created_at ASC
       LIMIT $1
-      FOR UPDATE SKIP LOCKED;
+      FOR UPDATE OF o SKIP LOCKED;
     `;
     const result = await client.query(selectQuery, [batchSize]);
 
