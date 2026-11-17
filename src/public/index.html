@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LedgerFlow — Chaos Simulator & Idempotent Double-Entry Ledger</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
+            mono: ['JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+          },
+          colors: {
+            darkBg: '#09090b',
+            darkCard: '#111113',
+            darkBorder: '#27272a',
+          }
+        }
+      }
+    }
+  </script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    /* Clean subtle scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(150, 150, 150, 0.2);
+      border-radius: 9999px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: rgba(150, 150, 150, 0.4);
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-[#f8fafc] text-[#0f172a] dark:bg-[#09090b] dark:text-[#fafafa] antialiased selection:bg-slate-200 dark:selection:bg-zinc-800 transition-colors duration-150">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    function formatPaise(paise) {
+      if (paise === undefined || paise === null) return '₹0.00';
+      const inr = (Number(paise) / 100).toLocaleString('en-IN', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      return `₹${inr}`;
+    }
+
+    function formatTime(isoStr) {
+      if (!isoStr) return '—';
+      const d = new Date(isoStr);
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    function truncateId(id) {
+      if (!id) return '';
+      return `${id.slice(0, 8)}…${id.slice(-4)}`;
+    }
+
+    function App() {
+      // 1. Theme State (defaults to system preference, stored in localStorage)
+      const [theme, setTheme] = useState(() => {
+        const saved = localStorage.getItem('theme');
+        if (saved) return saved;
+        return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      });
+
+      useEffect(() => {
+        if (theme === 'dark') {
+          document.documentElement.classList.add('dark');
+        } else {
+          document.documentElement.classList.remove('dark');
+        }
+        localStorage.setItem('theme', theme);
+      }, [theme]);
+
+      const toggleTheme = () => {
+        setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
+      };
+
+      // 2. Data State
+      const [accounts, setAccounts] = useState([]);
+      const [selectedAccountId, setSelectedAccountId] = useState(null);
+      const [accountLedger, setAccountLedger] = useState(null);
+      const [outboxEvents, setOutboxEvents] = useState([]);
+      const [merchantStatus, setMerchantStatus] = useState({ crashMode: false, receivedEvents: [] });
+      const [loading, setLoading] = useState(false);
+      const [toast, setToast] = useState(null);
+
+      // Active Tab in Right Column: 'wallets' | 'outbox'
+      const [activeTab, setActiveTab] = useState('wallets');
+
+      // 3. Transfer Form State
+      const [fromAcc, setFromAcc] = useState('');
+      const [toAcc, setToAcc] = useState('');
+      const [transferAmountInr, setTransferAmountInr] = useState('250');
+      const [sendWebhook, setSendWebhook] = useState(true);
+
+      // 4. Chaos Test State
+      const [chaosLoading, setChaosLoading] = useState(false);
+      const [doubleTapResult, setDoubleTapResult] = useState(null);
+      const [raceConditionResult, setRaceConditionResult] = useState(null);
+
+      // 5. Collapsible Create Wallet State
+      const [isCreateOpen, setIsCreateOpen] = useState(false);
+      const [newOwner, setNewOwner] = useState('');
+      const [newSeedInr, setNewSeedInr] = useState('500');
+
+      const showToast = (message, type = 'info') => {
+        setToast({ message, type, id: Date.now() });
+        setTimeout(() => setToast(null), 3500);
+      };
+
+      // Polling and API Fetchers
+      const fetchAccounts = async () => {
+        try {
+          const res = await fetch('/accounts?limit=50');
+          const data = await res.json();
+          if (data.data) {
+            setAccounts(data.data);
+            if (!selectedAccountId && data.data.length > 0) {
+              const firstId = data.data[0].id;
+              setSelectedAccountId(firstId);
+              fetchLedger(firstId);
+            }
+            // Auto-populate from/to if unset
+            if (!fromAcc && data.data.length > 0) setFromAcc(data.data[0].id);
+            if (!toAcc && data.data.length > 1) setToAcc(data.data[1].id);
+          }
+        } catch (e) {
+          console.error('Error fetching accounts:', e);
+        }
+      };
+
+      const fetchLedger = async (id) => {
+        if (!id) return;
+        try {
+          const res = await fetch(`/accounts/${id}/ledger`);
+          if (res.ok) {
+            const data = await res.json();
+            setAccountLedger(data);
+          }
+        } catch (e) {
+          console.error('Error fetching ledger:', e);
+        }
+      };
+
+      const fetchOutbox = async () => {
+        try {
+          const res = await fetch('/outbox?limit=50');
+          const data = await res.json();
+          if (data.data) setOutboxEvents(data.data);
+        } catch (e) {
+          console.error('Error fetching outbox:', e);
+        }
+      };
+
+      const fetchMerchant = async () => {
+        try {
+          const res = await fetch('/mock-merchant/status');
+          const data = await res.json();
+          setMerchantStatus(data);
+        } catch (e) {
+          console.error('Error fetching merchant:', e);
+        }
+      };
+
+      const refreshAll = async () => {
+        await Promise.all([fetchAccounts(), fetchOutbox(), fetchMerchant()]);
+        if (selectedAccountId) fetchLedger(selectedAccountId);
+      };
+
+      useEffect(() => {
+        refreshAll();
+        const interval = setInterval(refreshAll, 2000);
+        return () => clearInterval(interval);
+      }, [selectedAccountId]);
+
+      // Reset Demo Action
+      const handleResetDemo = async () => {
+        setLoading(true);
+        try {
+          // Call POST /demo/reset to truncate tables and seed Alice Sharma & Bob Patel
+          const res = await fetch('/demo/reset', { method: 'POST' });
+          const data = await res.json();
+
+          let alice = null;
+          let bob = null;
+
+          if (data.accounts && data.accounts.length >= 2) {
+            alice = data.accounts.find((a) => a.owner_name.includes('Alice')) || data.accounts[0];
+            bob = data.accounts.find((a) => a.owner_name.includes('Bob')) || data.accounts[1];
+          }
+
+          if (alice) {
+            setSelectedAccountId(alice.id);
+            setFromAcc(alice.id);
+            fetchLedger(alice.id);
+          }
+          if (bob) {
+            setToAcc(bob.id);
+          }
+
+          setTransferAmountInr('250');
+          setDoubleTapResult(null);
+          setRaceConditionResult(null);
+
+          showToast('Demo reset: Alice Sharma (₹1,000) & Bob Patel (₹500) ready', 'success');
+          await refreshAll();
+        } catch (err) {
+          showToast('Failed to reset demo: ' + err.message, 'error');
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      // Create Account
+      const handleCreateAccount = async (e) => {
+        e.preventDefault();
+        if (!newOwner.trim()) return;
+        try {
+          const paise = Math.round((Number(newSeedInr) || 0) * 100);
+          const res = await fetch('/accounts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              owner_name: newOwner.trim(),
+              currency: 'INR',
+              initial_credit_paise: paise,
+            }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            showToast(`Created wallet for ${data.owner_name} with ${formatPaise(data.balance_paise)}`, 'success');
+            setNewOwner('');
+            setNewSeedInr('500');
+            setIsCreateOpen(false);
+            fetchAccounts();
+            setSelectedAccountId(data.id);
+          } else {
+            showToast(data.message || 'Failed to create account', 'error');
+          }
+        } catch (err) {
+          showToast(err.message, 'error');
+        }
+      };
+
+      // Execute Single Transfer
+      const handleTransfer = async (e) => {
+        e.preventDefault();
+        if (!fromAcc || !toAcc) {
+          showToast('Select both From and To wallets', 'error');
+          return;
+        }
+        if (fromAcc === toAcc) {
+          showToast('Sender and receiver must be different accounts', 'error');
+          return;
+        }
+
+        const amountPaise = Math.round(Number(transferAmountInr) * 100);
+        if (!amountPaise || amountPaise <= 0) {
+          showToast('Enter a valid transfer amount', 'error');
+          return;
+        }
+
+        try {
+          const idempotencyKey = 'web-' + crypto.randomUUID();
+          const targetUrl = sendWebhook ? window.location.origin + '/mock-merchant/webhook' : undefined;
+
+          const res = await fetch('/transfers', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Idempotency-Key': idempotencyKey,
+            },
+            body: JSON.stringify({
+              from_account_id: fromAcc,
+              to_account_id: toAcc,
+              amount_paise: amountPaise,
+              webhook_url: targetUrl,
+            }),
+          });
+
+          const data = await res.json();
+          if (res.ok) {
+            showToast(`Transferred ₹${transferAmountInr} successfully`, 'success');
+            refreshAll();
+          } else {
+            showToast(data.message || 'Transfer failed', 'error');
+          }
+        } catch (err) {
+          showToast(err.message, 'error');
+        }
+      };
+
+      // Chaos 1: Double-Tap (20x same key)
+      const runDoubleTap = async () => {
+        if (!fromAcc || !toAcc) {
+          showToast('Select From and To wallets for Double-Tap test', 'error');
+          return;
+        }
+        setChaosLoading(true);
+        setDoubleTapResult(null);
+
+        const sharedKey = 'double-tap-' + crypto.randomUUID();
+        const amountPaise = Math.round(Number(transferAmountInr) * 100) || 10000;
+        const targetUrl = sendWebhook ? window.location.origin + '/mock-merchant/webhook' : undefined;
+
+        try {
+          const requests = Array.from({ length: 20 }, () =>
+            fetch('/transfers', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Idempotency-Key': sharedKey,
+              },
+              body: JSON.stringify({
+                from_account_id: fromAcc,
+                to_account_id: toAcc,
+                amount_paise: amountPaise,
+                webhook_url: targetUrl,
+              }),
+            }).then(async (res) => ({
+              status: res.status,
+              isReplay: res.headers.get('x-idempotent-replay') === 'true',
+              body: await res.json(),
+            }))
+          );
+
+          const results = await Promise.all(requests);
+          const firstExecutions = results.filter((r) => r.status === 201 && !r.isReplay).length;
+          const replays = results.filter((r) => r.status === 201 && r.isReplay).length;
+          const inProgress = results.filter((r) => r.status === 409).length;
+          const errors = results.filter((r) => r.status !== 201 && r.status !== 409).length;
+
+          setDoubleTapResult({
+            total: 20,
+            firstExecutions,
+            replays,
+            inProgress,
+            errors,
+          });
+
+          showToast('Double-Tap complete: ledger debited exactly once', 'success');
+          refreshAll();
+        } catch (err) {
+          showToast(err.message, 'error');
+        } finally {
+          setChaosLoading(false);
+        }
+      };
+
+      // Chaos 2: Overdraft Race Condition (20x parallel)
+      const runRaceCondition = async () => {
+        if (!fromAcc || !toAcc) {
+          showToast('Select From and To wallets for Race Condition test', 'error');
+          return;
+        }
+
+        setChaosLoading(true);
+        setRaceConditionResult(null);
+
+        let initialBalance = 0;
+        try {
+          const lRes = await fetch(`/accounts/${fromAcc}/ledger`);
+          const lData = await lRes.json();
+          initialBalance = lData.balance_paise || 0;
+        } catch {}
+
+        const singlePaise = 20000; // ₹200 per attempt
+        const targetUrl = sendWebhook ? window.location.origin + '/mock-merchant/webhook' : undefined;
+
+        try {
+          const requests = Array.from({ length: 20 }, (_, i) =>
+            fetch('/transfers', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Idempotency-Key': `race-${i}-${crypto.randomUUID()}`,
+              },
+              body: JSON.stringify({
+                from_account_id: fromAcc,
+                to_account_id: toAcc,
+                amount_paise: singlePaise,
+                webhook_url: targetUrl,
+              }),
+            }).then(async (res) => ({
+              status: res.status,
+              body: await res.json(),
+            }))
+          );
+
+          const results = await Promise.all(requests);
+          const successes = results.filter((r) => r.status === 201).length;
+          const insufficient = results.filter((r) => r.status === 422).length;
+          const otherErrors = results.filter((r) => r.status !== 201 && r.status !== 422).length;
+
+          const finalRes = await fetch(`/accounts/${fromAcc}/ledger`);
+          const finalData = await finalRes.json();
+          const finalBalance = finalData.balance_paise;
+
+          setRaceConditionResult({
+            totalFired: 20,
+            successes,
+            insufficient,
+            otherErrors,
+            initialBalance,
+            finalBalance,
+          });
+
+          showToast(`Race complete: ${successes} succeeded, ${insufficient} rejected. ₹0 overdraft`, 'success');
+          refreshAll();
+        } catch (err) {
+          showToast(err.message, 'error');
+        } finally {
+          setChaosLoading(false);
+        }
+      };
+
+      // Toggle Merchant Crash
+      const toggleCrashMode = async () => {
+        try {
+          const res = await fetch('/mock-merchant/crash', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ crash: !merchantStatus.crashMode }),
+          });
+          const data = await res.json();
+          setMerchantStatus((prev) => ({ ...prev, crashMode: data.crashMode }));
+          showToast(data.crashMode ? 'Merchant server crashed (500 Error)' : 'Merchant server recovered (200 OK)', data.crashMode ? 'error' : 'success');
+        } catch (e) {
+          showToast(e.message, 'error');
+        }
+      };
+
+      // Replay Outbox Event
+      const replayEvent = async (id) => {
+        try {
+          const res = await fetch(`/outbox/${id}/replay`, { method: 'POST' });
+          const data = await res.json();
+          if (res.ok) {
+            showToast('Event reset to PENDING for immediate redelivery', 'success');
+            fetchOutbox();
+          } else {
+            showToast(data.message || 'Failed to replay event', 'error');
+          }
+        } catch (e) {
+          showToast(e.message, 'error');
+        }
+      };
+
+      const selectedAccount = accounts.find((a) => a.id === selectedAccountId);
+
+      return (
+        <div className="min-h-screen flex flex-col font-sans">
+          {/* Toast Notification */}
+          {toast && (
+            <div className="fixed bottom-5 right-5 z-50 flex items-center space-x-2 px-3.5 py-2.5 rounded-lg border text-xs font-medium shadow-md backdrop-blur-md bg-white/95 dark:bg-[#18181b]/95 border-slate-200 dark:border-[#27272a] text-slate-900 dark:text-zinc-100 transition-all">
+              <span className={`w-1.5 h-1.5 rounded-full ${toast.type === 'error' ? 'bg-rose-500' : 'bg-emerald-500'}`} />
+              <span>{toast.message}</span>
+            </div>
+          )}
+
+          {/* Top Header */}
+          <header className="border-b border-slate-200 dark:border-[#27272a] bg-white dark:bg-[#111113] sticky top-0 z-40">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
+              {/* Left: Brand & 1-line subtitle */}
+              <div className="flex items-center space-x-3">
+                <div className="w-7 h-7 rounded-md bg-slate-900 dark:bg-zinc-100 flex items-center justify-center text-white dark:text-zinc-900 font-bold text-xs tracking-wider">
+                  LF
+                </div>
+                <div>
+                  <div className="flex items-center space-x-2">
+                    <span className="font-semibold text-sm tracking-tight text-slate-900 dark:text-zinc-100">LedgerFlow</span>
+                    <span className="hidden sm:inline-block text-[11px] text-slate-400 dark:text-zinc-500 font-mono">v1.0</span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 dark:text-zinc-400 hidden sm:block">Idempotent Double-Entry Ledger</p>
+                </div>
+              </div>
+
+              {/* Right: Actions */}
+              <div className="flex items-center space-x-2 sm:space-x-3">
+                <button
+                  type="button"
+                  onClick={handleResetDemo}
+                  disabled={loading}
+                  className="px-2.5 py-1.5 rounded-md text-xs font-medium border border-slate-200 dark:border-[#27272a] bg-white dark:bg-[#18181b] hover:bg-slate-50 dark:hover:bg-[#27272a] text-slate-700 dark:text-zinc-200 transition-colors flex items-center space-x-1.5 disabled:opacity-50"
+                  title="Resets demo state and seeds Alice & Bob wallets"
+                >
+                  <svg className="w-3.5 h-3.5 text-slate-500 dark:text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  <span>Reset Demo</span>
+                </button>
+
+                <a
+                  href="/docs"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-2.5 py-1.5 rounded-md text-xs font-medium border border-slate-200 dark:border-[#27272a] bg-white dark:bg-[#18181b] hover:bg-slate-50 dark:hover:bg-[#27272a] text-slate-700 dark:text-zinc-200 transition-colors flex items-center space-x-1.5"
+                >
+                  <span>API Docs</span>
+                  <svg className="w-3 h-3 text-slate-400 dark:text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                  </svg>
+                </a>
+
+                {/* Light / Dark Mode Toggle */}
+                <button
+                  type="button"
+                  onClick={toggleTheme}
+                  className="p-1.5 rounded-md border border-slate-200 dark:border-[#27272a] bg-white dark:bg-[#18181b] hover:bg-slate-50 dark:hover:bg-[#27272a] text-slate-700 dark:text-zinc-200 transition-colors"
+                  aria-label="Toggle Theme"
+                  title={theme === 'dark' ? 'Switch to Light mode' : 'Switch to Dark mode'}
+                >
+                  {theme === 'dark' ? (
+                    /* Sun Icon */
+                    <svg className="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+                    </svg>
+                  ) : (
+                    /* Moon Icon */
+                    <svg className="w-4 h-4 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Main Content: Simple 2-Column Layout */}
+          <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 flex-1 w-full flex flex-col lg:flex-row gap-6">
+            
+            {/* LEFT COLUMN: Actions (~40% width) */}
+            <div className="w-full lg:w-[410px] shrink-0 space-y-4">
+              
+              {/* 1. Quick Transfer Card */}
+              <div className="bg-white dark:bg-[#111113] border border-slate-200 dark:border-[#27272a] rounded-xl p-4 sm:p-5 shadow-sm space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 tracking-tight">Quick Transfer</h2>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 border border-slate-200 dark:border-zinc-700">
+                    ACID Double-Entry
+                  </span>
+                </div>
+
+                <form onSubmit={handleTransfer} className="space-y-3.5">
+                  {/* From Wallet */}
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 dark:text-zinc-400 mb-1">From Wallet</label>
+                    <select
+                      value={fromAcc}
+                      onChange={(e) => setFromAcc(e.target.value)}
+                      className="w-full text-xs rounded-lg px-2.5 py-2 border bg-white dark:bg-[#18181b] border-slate-200 dark:border-[#27272a] text-slate-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-slate-900 dark:focus:ring-zinc-100"
+                    >
+                      <option value="">Select source wallet...</option>
+                      {accounts.map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.owner_name} ({formatPaise(a.balance_paise)})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* To Wallet */}
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 dark:text-zinc-400 mb-1">To Wallet</label>
+                    <select
+                      value={toAcc}
+                      onChange={(e) => setToAcc(e.target.value)}
+                      className="w-full text-xs rounded-lg px-2.5 py-2 border bg-white dark:bg-[#18181b] border-slate-200 dark:border-[#27272a] text-slate-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-slate-900 dark:focus:ring-zinc-100"
+                    >
+                      <option value="">Select destination wallet...</option>
+                      {accounts.map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.owner_name} ({formatPaise(a.balance_paise)})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Amount with currency symbol prefix & quick pills */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-[11px] font-medium text-slate-500 dark:text-zinc-400">Amount (INR)</label>
+                      <div className="flex items-center space-x-1">
+                        {['100', '250', '500'].map((val) => (
+                          <button
+                            key={val}
+                            type="button"
+                            onClick={() => setTransferAmountInr(val)}
+                            className={`px-1.5 py-0.5 text-[10px] font-mono rounded border transition-colors ${
+                              transferAmountInr === val
+                                ? 'bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-zinc-900 dark:border-white'
+                                : 'bg-slate-50 dark:bg-[#18181b] text-slate-600 dark:text-zinc-400 border-slate-200 dark:border-[#27272a] hover:bg-slate-100 dark:hover:bg-[#27272a]'
+                            }`}
+                          >
+                            ₹{val}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="relative">
+                      <span className="absolute left-3 top-2 text-xs text-slate-400 dark:text-zinc-500 font-mono">₹</span>
+                      <input
+                        type="number"
+                        min="1"
+                        step="any"
+                        value={transferAmountInr}
+                        onChange={(e) => setTransferAmountInr(e.target.value)}
+                        placeholder="250"
+                        className="w-full text-xs font-mono pl-7 pr-3 py-2 rounded-lg border bg-white dark:bg-[#18181b] border-slate-200 dark:border-[#27272a] text-slate-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-slate-900 dark:focus:ring-zinc-100"
+                        required
+                      />
+                    </div>
+                  </div>
+
+                  {/* Send Webhook Checkbox */}
+                  <div className="flex items-center justify-between pt-1">
+                    <label className="flex items-center space-x-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={sendWebhook}
+                        onChange={(e) => setSendWebhook(e.target.checked)}
+                        className="rounded border-slate-300 dark:border-zinc-700 text-slate-900 focus:ring-slate-900 h-3.5 w-3.5"
+                      />
+                      <span className="text-xs text-slate-700 dark:text-zinc-300">Send Webhook to Mock Merchant</span>
+                    </label>
+                    <span className="text-[10px] text-slate-400 dark:text-zinc-500 font-mono">HMAC-SHA256</span>
+                  </div>
+
+                  {/* Primary Submit Button */}
+                  <button
+                    type="submit"
+                    disabled={loading || chaosLoading}
+                    className="w-full py-2.5 px-4 rounded-lg text-xs font-medium bg-slate-900 text-white hover:bg-slate-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-100 transition-colors shadow-sm disabled:opacity-50 flex items-center justify-center space-x-1.5"
+                  >
+                    <span>Send Payment</span>
+                    <span className="font-mono text-[11px] opacity-80">(₹{transferAmountInr || 0})</span>
+                  </button>
+                </form>
+              </div>
+
+              {/* 2. Chaos Tests Card */}
+              <div className="bg-white dark:bg-[#111113] border border-slate-200 dark:border-[#27272a] rounded-xl p-4 sm:p-5 shadow-sm space-y-3">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 tracking-tight">Chaos Testing</h2>
+                  <p className="text-[11px] text-slate-500 dark:text-zinc-400 mt-0.5">Live concurrency and idempotency verification</p>
+                </div>
+
+                <div className="grid grid-cols-1 gap-2 pt-1">
+                  {/* Button 1: Double-Tap */}
+                  <button
+                    type="button"
+                    onClick={runDoubleTap}
+                    disabled={chaosLoading || !fromAcc || !toAcc}
+                    className="w-full py-2 px-3 text-left rounded-lg border border-slate-200 dark:border-[#27272a] bg-slate-50 dark:bg-[#18181b] hover:bg-slate-100 dark:hover:bg-[#27272a] transition-colors disabled:opacity-50 flex items-center justify-between"
+                  >
+                    <div>
+                      <div className="text-xs font-medium text-slate-900 dark:text-zinc-100">Test Double-Tap</div>
+                      <div className="text-[10px] text-slate-500 dark:text-zinc-400">Simulate 20x Double-Tap (shared key)</div>
+                    </div>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-200 dark:bg-zinc-700 text-slate-700 dark:text-zinc-300">
+                      Shared Key
+                    </span>
+                  </button>
+
+                  {/* Button 2: Overdraft Race */}
+                  <button
+                    type="button"
+                    onClick={runRaceCondition}
+                    disabled={chaosLoading || !fromAcc || !toAcc}
+                    className="w-full py-2 px-3 text-left rounded-lg border border-slate-200 dark:border-[#27272a] bg-slate-50 dark:bg-[#18181b] hover:bg-slate-100 dark:hover:bg-[#27272a] transition-colors disabled:opacity-50 flex items-center justify-between"
+                  >
+                    <div>
+                      <div className="text-xs font-medium text-slate-900 dark:text-zinc-100">Test Overdraft Race</div>
+                      <div className="text-[10px] text-slate-500 dark:text-zinc-400">Simulate 20x Race Condition (parallel overdraft)</div>
+                    </div>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-200 dark:bg-zinc-700 text-slate-700 dark:text-zinc-300">
+                      Row Mutex
+                    </span>
+                  </button>
+                </div>
+
+                {/* Inline Double-Tap Result Banner */}
+                {doubleTapResult && (
+                  <div className="p-3 rounded-lg border border-slate-200 dark:border-[#27272a] bg-slate-50 dark:bg-[#18181b] text-xs space-y-1">
+                    <div className="flex items-center justify-between font-medium text-slate-900 dark:text-zinc-100">
+                      <span>Double-Tap Result</span>
+                      <span className="text-[10px] text-emerald-600 dark:text-emerald-400">✓ Deducted Exactly Once</span>
+                    </div>
+                    <p className="text-[11px] text-slate-600 dark:text-zinc-400">
+                      {doubleTapResult.firstExecutions} executed, {doubleTapResult.replays + doubleTapResult.inProgress} blocked by idempotency ({doubleTapResult.replays} replays, {doubleTapResult.inProgress} in-flight 409).
+                    </p>
+                  </div>
+                )}
+
+                {/* Inline Race Condition Result Banner */}
+                {raceConditionResult && (
+                  <div className="p-3 rounded-lg border border-slate-200 dark:border-[#27272a] bg-slate-50 dark:bg-[#18181b] text-xs space-y-1">
+                    <div className="flex items-center justify-between font-medium text-slate-900 dark:text-zinc-100">
+                      <span>Race Condition Result</span>
+                      <span className="text-[10px] text-emerald-600 dark:text-emerald-400">✓ Zero Overdraft Guaranteed</span>
+                    </div>
+                    <p className="text-[11px] text-slate-600 dark:text-zinc-400">
+                      {raceConditionResult.successes} succeeded, {raceConditionResult.insufficient} rejected (422) — Initial: {formatPaise(raceConditionResult.initialBalance)} → Final: {formatPaise(raceConditionResult.finalBalance)}.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* 3. Merchant Status Toggle */}
+              <div className="bg-white dark:bg-[#111113] border border-slate-200 dark:border-[#27272a] rounded-xl p-4 sm:p-5 shadow-sm space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h2 className="text-sm font-semibold text-slate-900 dark:text-zinc-100 tracking-tight">Mock Merchant Receiver</h2>
+                    <p className="text-[11px] text-slate-500 dark:text-zinc-400 mt-0.5">Simulate partner failures & BullMQ retries</p>
+                  </div>
+                  <span
+                    className={`text-[10px] font-medium px-2 py-0.5 rounded border ${
+                      merchantStatus.crashMode
+                        ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-800/50'
+                        : 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/50'
+                    }`}
+                  >
+                    {merchantStatus.crashMode ? 'Crashed (500 Error)' : 'Online (200 OK)'}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-between pt-1">
+                  <span className="text-xs text-slate-600 dark:text-zinc-400">
+                    {merchantStatus.crashMode ? 'Upstream endpoint failing all webhooks' : 'Ready to accept signed webhooks'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={toggleCrashMode}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border ${
+                      merchantStatus.crashMode
+                        ? 'bg-white hover:bg-slate-50 text-slate-900 border-slate-200 dark:bg-[#18181b] dark:text-zinc-100 dark:border-[#27272a] dark:hover:bg-[#27272a]'
+                        : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100 dark:bg-rose-950/30 dark:text-rose-300 dark:border-rose-800/50 dark:hover:bg-rose-900/40'
+                    }`}
+                  >
+                    {merchantStatus.crashMode ? 'Recover Merchant' : 'Simulate Crash'}
+                  </button>
+                </div>
+              </div>
+
+              {/* 4. Collapsible "Create Wallet" Form */}
+              <div className="bg-white dark:bg-[#111113] border border-slate-200 dark:border-[#27272a] rounded-xl overflow-hidden shadow-sm transition-all">
+                <button
+                  type="button"
+                  onClick={() => setIsCreateOpen(!isCreateOpen)}
+                  className="w-full px-4 py-3 flex items-center justify-between text-left text-xs font-medium text-slate-700 dark:text-zinc-300 hover:bg-slate-50 dark:hover:bg-[#18181b] transition-colors"
+                >
+                  <span className="flex items-center space-x-1.5">
+                    <span>+</span>
+                    <span>Create New Wallet</span>
+                  </span>
+                  <svg
+                    className={`w-3.5 h-3.5 text-slate-400 dark:text-zinc-500 transition-transform ${isCreateOpen ? 'rotate-180' : ''}`}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
+                  </svg>
+                </button>
+
+                {isCreateOpen && (
+                  <form onSubmit={handleCreateAccount} className="px-4 pb-4 pt-1 space-y-3 border-t border-slate-100 dark:border-[#27272a]">
+                    <div>
+                      <label className="block text-[11px] font-medium text-slate-500 dark:text-zinc-400 mb-1">Owner Name</label>
+                      <input
+                        type="text"
+                        value={newOwner}
+                        onChange={(e) => setNewOwner(e.target.value)}
+                        placeholder="e.g. Charlie"
+                        className="w-full text-xs px-2.5 py-1.5 rounded-lg border bg-white dark:bg-[#18181b] border-slate-200 dark:border-[#27272a] text-slate-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-slate-900 dark:focus:ring-zinc-100"
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-medium text-slate-500 dark:text-zinc-400 mb-1">Initial Balance (INR)</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={newSeedInr}
+                        onChange={(e) => setNewSeedInr(e.target.value)}
+                        placeholder="500"
+                        className="w-full text-xs font-mono px-2.5 py-1.5 rounded-lg border bg-white dark:bg-[#18181b] border-slate-200 dark:border-[#27272a] text-slate-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-slate-900 dark:focus:ring-zinc-100"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="w-full py-1.5 text-xs font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-100 transition-colors"
+                    >
+                      Save Wallet
+                    </button>
+                  </form>
+                )}
+              </div>
+
+            </div>
+
+            {/* RIGHT COLUMN: Live State (~60% width) */}
+            <div className="flex-1 min-w-0 space-y-4">
+              
+              {/* Tab Switcher */}
+              <div className="flex items-center space-x-2 border-b border-slate-200 dark:border-[#27272a] pb-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('wallets')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex items-center space-x-1.5 ${
+                    activeTab === 'wallets'
+                      ? 'bg-slate-900 text-white dark:bg-white dark:text-zinc-900 shadow-sm'
+                      : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-zinc-200'
+                  }`}
+                >
+                  <span>Accounts & Ledger</span>
+                  <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded ${
+                    activeTab === 'wallets' ? 'bg-slate-800 text-slate-200 dark:bg-zinc-200 dark:text-zinc-800' : 'bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400'
+                  }`}>
+                    {accounts.length}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('outbox')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex items-center space-x-1.5 ${
+                    activeTab === 'outbox'
+                      ? 'bg-slate-900 text-white dark:bg-white dark:text-zinc-900 shadow-sm'
+                      : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-zinc-200'
+                  }`}
+                >
+                  <span>Webhook Outbox</span>
+                  <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded ${
+                    activeTab === 'outbox' ? 'bg-slate-800 text-slate-200 dark:bg-zinc-200 dark:text-zinc-800' : 'bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400'
+                  }`}>
+                    {outboxEvents.length}
+                  </span>
+                </button>
+              </div>
+
+              {/* TAB 1: Wallets & Ledger */}
+              {activeTab === 'wallets' && (
+                <div className="space-y-4">
+                  {/* Top Wallets List */}
+                  <div className="bg-white dark:bg-[#111113] border border-slate-200 dark:border-[#27272a] rounded-xl p-4 sm:p-5 shadow-sm space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs font-semibold text-slate-500 dark:text-zinc-400 uppercase tracking-wider">Active Wallets</h3>
+                      <span className="text-[11px] text-slate-400 dark:text-zinc-500">Click a wallet to inspect ledger</span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      {accounts.slice(0, 8).map((acc) => {
+                        const isSelected = acc.id === selectedAccountId;
+                        return (
+                          <div
+                            key={acc.id}
+                            onClick={() => {
+                              setSelectedAccountId(acc.id);
+                              fetchLedger(acc.id);
+                            }}
+                            className={`p-3 rounded-lg border cursor-pointer transition-all ${
+                              isSelected
+                                ? 'border-slate-900 dark:border-zinc-100 bg-slate-50/70 dark:bg-[#18181b]'
+                                : 'border-slate-200 dark:border-[#27272a] bg-white dark:bg-[#111113] hover:border-slate-300 dark:hover:border-zinc-700'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-medium text-slate-900 dark:text-zinc-100">{acc.owner_name}</span>
+                              <span className="text-xs font-mono font-semibold text-slate-900 dark:text-zinc-100">
+                                {formatPaise(acc.balance_paise)}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between mt-1 text-[10px] font-mono text-slate-400 dark:text-zinc-500">
+                              <span>{truncateId(acc.id)}</span>
+                              <span>{acc.currency}</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Selected Wallet Ledger Statement */}
+                  <div className="bg-white dark:bg-[#111113] border border-slate-200 dark:border-[#27272a] rounded-xl p-4 sm:p-5 shadow-sm space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-xs font-semibold text-slate-900 dark:text-zinc-100">
+                          Immutable Ledger Entries: {selectedAccount ? selectedAccount.owner_name : 'Select a wallet'}
+                        </h3>
+                        {selectedAccount && (
+                          <p className="text-[11px] text-slate-400 dark:text-zinc-500 font-mono mt-0.5">
+                            ID: {selectedAccount.id} • Balance: {formatPaise(selectedAccount.balance_paise)}
+                          </p>
+                        )}
+                      </div>
+                      <span className="text-[10px] font-mono text-slate-500 dark:text-zinc-400">Latest 10 Entries</span>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="border-b border-slate-100 dark:border-[#27272a] text-slate-400 dark:text-zinc-500 text-[10px] uppercase tracking-wider">
+                            <th className="py-2 font-medium">Time</th>
+                            <th className="py-2 font-medium">Type</th>
+                            <th className="py-2 font-medium">Amount</th>
+                            <th className="py-2 font-medium">Tx ID</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 dark:divide-[#27272a]">
+                          {(() => {
+                            const entries = accountLedger ? (accountLedger.ledger_entries || accountLedger.entries || []) : [];
+                            const displayEntries = [...entries].reverse().slice(0, 10);
+                            if (displayEntries.length === 0) {
+                              return (
+                                <tr>
+                                  <td colSpan="4" className="py-6 text-center text-slate-400 dark:text-zinc-500 text-xs">
+                                    No ledger transactions found for this wallet.
+                                  </td>
+                                </tr>
+                              );
+                            }
+                            return displayEntries.map((entry) => {
+                              const isCredit = entry.entry_type === 'CREDIT';
+                              return (
+                                <tr key={entry.id} className="hover:bg-slate-50/50 dark:hover:bg-[#18181b]/50">
+                                  <td className="py-2 font-mono text-slate-500 dark:text-zinc-400 text-[11px]">
+                                    {formatTime(entry.created_at)}
+                                  </td>
+                                  <td className="py-2">
+                                    <span
+                                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border ${
+                                        isCredit
+                                          ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/50'
+                                          : 'bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-300 border-slate-200 dark:border-zinc-700'
+                                      }`}
+                                    >
+                                      {entry.entry_type}
+                                    </span>
+                                  </td>
+                                  <td className="py-2 font-mono font-medium">
+                                    <span className={isCredit ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-900 dark:text-zinc-100'}>
+                                      {isCredit ? '+' : '-'}{formatPaise(entry.amount)}
+                                    </span>
+                                  </td>
+                                  <td className="py-2 font-mono text-slate-400 dark:text-zinc-500 text-[11px]">
+                                    {truncateId(entry.transaction_id)}
+                                  </td>
+                                </tr>
+                              );
+                            });
+                          })()}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 2: Webhook Outbox */}
+              {activeTab === 'outbox' && (
+                <div className="space-y-4">
+                  {/* Outbox Events Table */}
+                  <div className="bg-white dark:bg-[#111113] border border-slate-200 dark:border-[#27272a] rounded-xl p-4 sm:p-5 shadow-sm space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-xs font-semibold text-slate-900 dark:text-zinc-100">Transactional Outbox & Worker Retries</h3>
+                        <p className="text-[11px] text-slate-500 dark:text-zinc-400 mt-0.5">Reliable at-least-once delivery worker</p>
+                      </div>
+                      <span className="text-[10px] font-mono text-slate-400 dark:text-zinc-500">Auto-Polling</span>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="border-b border-slate-100 dark:border-[#27272a] text-slate-400 dark:text-zinc-500 text-[10px] uppercase tracking-wider">
+                            <th className="py-2 font-medium">Status</th>
+                            <th className="py-2 font-medium">Event Type</th>
+                            <th className="py-2 font-medium">Attempts</th>
+                            <th className="py-2 font-medium">Target</th>
+                            <th className="py-2 font-medium text-right">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 dark:divide-[#27272a]">
+                          {outboxEvents.slice(0, 10).map((evt) => {
+                            let statusBadge = (
+                              <span className="px-1.5 py-0.5 rounded text-[10px] font-medium border bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800/50">
+                                PENDING
+                              </span>
+                            );
+                            if (evt.status === 'DELIVERED') {
+                              statusBadge = (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-medium border bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/50">
+                                  DELIVERED
+                                </span>
+                              );
+                            } else if (evt.status === 'DEAD_LETTER') {
+                              statusBadge = (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-medium border bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-800/50">
+                                  DEAD LETTER
+                                </span>
+                              );
+                            }
+
+                            return (
+                              <tr key={evt.id} className="hover:bg-slate-50/50 dark:hover:bg-[#18181b]/50">
+                                <td className="py-2">{statusBadge}</td>
+                                <td className="py-2 font-mono text-[11px] text-slate-800 dark:text-zinc-200">{evt.event_type}</td>
+                                <td className="py-2 font-mono text-slate-500 dark:text-zinc-400 text-[11px]">{evt.attempts}/5</td>
+                                <td className="py-2 font-mono text-slate-400 dark:text-zinc-500 text-[11px]">
+                                  {evt.target_url.replace(window.location.origin, '')}
+                                </td>
+                                <td className="py-2 text-right">
+                                  <button
+                                    type="button"
+                                    onClick={() => replayEvent(evt.id)}
+                                    className="px-2 py-0.5 rounded border border-slate-200 dark:border-[#27272a] hover:bg-slate-100 dark:hover:bg-[#27272a] text-[10px] font-mono text-slate-600 dark:text-zinc-300 transition-colors"
+                                  >
+                                    Replay
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                          {outboxEvents.length === 0 && (
+                            <tr>
+                              <td colSpan="5" className="py-6 text-center text-slate-400 dark:text-zinc-500 text-xs">
+                                No outbox events queued yet.
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* Mock Merchant Verified Payloads */}
+                  <div className="bg-white dark:bg-[#111113] border border-slate-200 dark:border-[#27272a] rounded-xl p-4 sm:p-5 shadow-sm space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-xs font-semibold text-slate-900 dark:text-zinc-100">
+                          Mock Merchant Received Payloads ({merchantStatus.receivedEvents.length})
+                        </h3>
+                        <p className="text-[11px] text-slate-500 dark:text-zinc-400 mt-0.5">Verified with HMAC-SHA256 signature</p>
+                      </div>
+                      <span className="text-[10px] font-mono text-emerald-600 dark:text-emerald-400">Signature Verified</span>
+                    </div>
+
+                    <div className="space-y-2">
+                      {merchantStatus.receivedEvents.slice(0, 5).map((rev) => (
+                        <div
+                          key={rev.id}
+                          className="p-3 rounded-lg border border-slate-100 dark:border-[#27272a] bg-slate-50 dark:bg-[#18181b] space-y-1 font-mono text-[11px]"
+                        >
+                          <div className="flex items-center justify-between text-slate-400 dark:text-zinc-500 text-[10px]">
+                            <span>ID: {truncateId(rev.id)}</span>
+                            <span>{formatTime(rev.received_at)}</span>
+                          </div>
+                          <div className="text-slate-800 dark:text-zinc-200 truncate">
+                            <span className="text-slate-400 dark:text-zinc-500">Payload: </span>
+                            {JSON.stringify(rev.payload)}
+                          </div>
+                          <div className="text-[10px] text-slate-400 dark:text-zinc-500 truncate">
+                            <span className="text-slate-500 dark:text-zinc-400">Sig: </span>
+                            {rev.signature}
+                          </div>
+                        </div>
+                      ))}
+                      {merchantStatus.receivedEvents.length === 0 && (
+                        <div className="py-6 text-center text-slate-400 dark:text-zinc-500 text-xs">
+                          No webhook payloads received yet.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+            </div>
+          </main>
+
+          {/* Minimal Footer */}
+          <footer className="border-t border-slate-200 dark:border-[#27272a] bg-white dark:bg-[#111113] py-3 text-center text-[11px] text-slate-400 dark:text-zinc-500 font-mono">
+            LedgerFlow — Idempotent Double-Entry Payment & Webhook Delivery Engine
+          </footer>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

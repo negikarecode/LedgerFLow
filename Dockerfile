@@ -12,6 +12,7 @@ RUN npm install
 # Copy source code and config
 COPY tsconfig.json ./
 COPY src ./src
+COPY public ./public
 
 # Build TypeScript to dist
 RUN npm run build

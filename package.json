@@ -10,7 +10,8 @@
     "start": "node dist/api/server.js",
     "worker:start": "node dist/worker/index.js",
     "migrate": "tsx src/db/migrate.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "benchmark": "tsx scripts/benchmark.ts"
   },
   "keywords": [
     "ledger",
