@@ -13,6 +13,7 @@ const envSchema = z.object({
   POSTGRES_DB: z.string().optional().default('ledgerflow'),
   POSTGRES_PORT: z.coerce.number().optional().default(5432),
   REDIS_PORT: z.coerce.number().optional().default(6379),
+  WEBHOOK_SECRET: z.string().default('default-ledgerflow-secret-key-12345'),
 });
 
 export const env = envSchema.parse(process.env);
