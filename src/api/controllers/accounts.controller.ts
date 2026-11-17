@@ -180,3 +180,69 @@ export async function getAccountById(
     next(err);
   }
 }
+
+export async function getAccountLedger(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const { id } = req.params;
+
+    const accountQuery = `
+      SELECT id, owner_name, currency, created_at 
+      FROM accounts 
+      WHERE id = $1;
+    `;
+    const accountResult = await query(accountQuery, [id]);
+
+    if (accountResult.rows.length === 0) {
+      res.status(404).json({
+        error: 'Not Found',
+        message: `Account with ID '${id}' not found`,
+      });
+      return;
+    }
+
+    const balanceQuery = `
+      SELECT COALESCE(SUM(
+        CASE 
+          WHEN entry_type = 'CREDIT' THEN amount
+          WHEN entry_type = 'DEBIT' THEN -amount
+          ELSE 0
+        END
+      ), 0)::BIGINT AS balance_paise
+      FROM ledger_entries
+      WHERE account_id = $1;
+    `;
+    const balanceResult = await query(balanceQuery, [id]);
+
+    const entriesQuery = `
+      SELECT id, transaction_id, account_id, entry_type, amount, created_at
+      FROM ledger_entries
+      WHERE account_id = $1
+      ORDER BY created_at ASC, id ASC;
+    `;
+    const entriesResult = await query(entriesQuery, [id]);
+
+    const account = accountResult.rows[0];
+
+    res.status(200).json({
+      account_id: account.id,
+      owner_name: account.owner_name,
+      currency: account.currency,
+      balance_paise: Number(balanceResult.rows[0].balance_paise),
+      created_at: account.created_at,
+      ledger_entries: entriesResult.rows.map((entry) => ({
+        id: entry.id,
+        transaction_id: entry.transaction_id,
+        account_id: entry.account_id,
+        entry_type: entry.entry_type,
+        amount: Number(entry.amount),
+        created_at: entry.created_at,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+}

@@ -82,6 +82,9 @@ describe('LedgerFlow API Suite', () => {
       expect(res.body.info.title).toBe('LedgerFlow API');
       expect(res.body.paths['/health']).toBeDefined();
       expect(res.body.paths['/accounts']).toBeDefined();
+      expect(res.body.paths['/transfers']).toBeDefined();
+      expect(res.body.paths['/accounts/{id}/ledger']).toBeDefined();
+      expect(res.body.paths['/outbox']).toBeDefined();
     });
   });
 
@@ -177,6 +180,97 @@ describe('LedgerFlow API Suite', () => {
       expect(res.status).toBe(200);
       expect(res.body.data).toHaveLength(1);
       expect(res.body.data[0].balance_paise).toBe(25000);
+      expect(res.body.pagination.total).toBe(1);
+    });
+  });
+
+  describe('GET /accounts/:id/ledger', () => {
+    it('should return 404 when account does not exist', async () => {
+      vi.spyOn(poolModule, 'query').mockResolvedValue({ rows: [] } as any);
+
+      const res = await request(app).get('/accounts/a0000000-0000-0000-0000-000000000099/ledger');
+      expect(res.status).toBe(404);
+      expect(res.body.error).toBe('Not Found');
+    });
+
+    it('should return chronological ledger entries and balance for valid account', async () => {
+      vi.spyOn(poolModule, 'query').mockImplementation((sql: string) => {
+        if (sql.includes('FROM accounts') && sql.includes('WHERE id = $1')) {
+          return Promise.resolve({
+            rows: [
+              {
+                id: 'a0000000-0000-0000-0000-000000000001',
+                owner_name: 'Ledger Alice',
+                currency: 'INR',
+                created_at: new Date().toISOString(),
+              },
+            ],
+          } as any);
+        }
+        if (sql.includes('AS balance_paise')) {
+          return Promise.resolve({ rows: [{ balance_paise: '75000' }] } as any);
+        }
+        if (sql.includes('ORDER BY created_at ASC')) {
+          return Promise.resolve({
+            rows: [
+              {
+                id: 'e0000000-0000-0000-0000-000000000001',
+                transaction_id: 't0000000-0000-0000-0000-000000000001',
+                account_id: 'a0000000-0000-0000-0000-000000000001',
+                entry_type: 'CREDIT',
+                amount: '100000',
+                created_at: new Date().toISOString(),
+              },
+              {
+                id: 'e0000000-0000-0000-0000-000000000002',
+                transaction_id: 't0000000-0000-0000-0000-000000000002',
+                account_id: 'a0000000-0000-0000-0000-000000000001',
+                entry_type: 'DEBIT',
+                amount: '25000',
+                created_at: new Date().toISOString(),
+              },
+            ],
+          } as any);
+        }
+        return Promise.resolve({ rows: [] } as any);
+      });
+
+      const res = await request(app).get('/accounts/a0000000-0000-0000-0000-000000000001/ledger');
+      expect(res.status).toBe(200);
+      expect(res.body.account_id).toBe('a0000000-0000-0000-0000-000000000001');
+      expect(res.body.balance_paise).toBe(75000);
+      expect(res.body.ledger_entries).toHaveLength(2);
+      expect(res.body.ledger_entries[0].amount).toBe(100000);
+      expect(res.body.ledger_entries[1].amount).toBe(25000);
+    });
+  });
+
+  describe('GET /outbox', () => {
+    it('should list outbox events with pagination metadata', async () => {
+      vi.spyOn(poolModule, 'query').mockImplementation((sql: string) => {
+        if (sql.includes('COUNT(*)')) {
+          return Promise.resolve({ rows: [{ total: 1 }] } as any);
+        }
+        return Promise.resolve({
+          rows: [
+            {
+              id: 'o0000000-0000-0000-0000-000000000001',
+              event_type: 'transfer.completed',
+              payload: { test: true },
+              target_url: 'https://example.com/webhook',
+              status: 'PENDING',
+              attempts: 0,
+              next_retry_at: null,
+              created_at: new Date().toISOString(),
+            },
+          ],
+        } as any);
+      });
+
+      const res = await request(app).get('/outbox');
+      expect(res.status).toBe(200);
+      expect(res.body.data).toHaveLength(1);
+      expect(res.body.data[0].status).toBe('PENDING');
       expect(res.body.pagination.total).toBe(1);
     });
   });

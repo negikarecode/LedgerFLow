@@ -3,6 +3,7 @@ import {
   createAccount,
   listAccounts,
   getAccountById,
+  getAccountLedger,
 } from '../controllers/accounts.controller';
 import {
   validateBody,
@@ -27,6 +28,12 @@ accountsRouter.post(
   '/accounts',
   validateBody(createAccountSchema),
   createAccount
+);
+
+accountsRouter.get(
+  '/accounts/:id/ledger',
+  validateParams(accountParamsSchema),
+  getAccountLedger
 );
 
 accountsRouter.get(
