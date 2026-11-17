@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { redis } from '../../redis/client';
 import { query } from '../../db/pool';
 import { env } from '../../config/env';
+import { transfersTotal, idempotencyReplaysTotal } from '../../observability/metrics';
 
 const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
 
@@ -157,6 +158,7 @@ export async function idempotencyMiddleware(
 
       if (existingVal === 'LOCKED') {
         // Legacy format lock in-flight
+        transfersTotal.inc({ outcome: 'conflict' });
         res.status(409).json({
           error: 'Conflict',
           message: 'Request already in progress',
@@ -171,6 +173,7 @@ export async function idempotencyMiddleware(
           // Case A: Key is currently in flight
           if (parsed.status === 'IN_FLIGHT') {
             if (parsed.request_hash && parsed.request_hash !== requestFingerprint) {
+              transfersTotal.inc({ outcome: 'key_reuse_mismatch' });
               res.status(422).json({
                 error: 'Unprocessable Entity',
                 code: 'IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD',
@@ -179,6 +182,7 @@ export async function idempotencyMiddleware(
               });
               return;
             }
+            transfersTotal.inc({ outcome: 'conflict' });
             res.status(409).json({
               error: 'Conflict',
               message: 'Request already in progress',
@@ -189,6 +193,7 @@ export async function idempotencyMiddleware(
           // Case B: Completed cached response
           if (parsed.response_status) {
             if (parsed.request_hash && parsed.request_hash !== requestFingerprint) {
+              transfersTotal.inc({ outcome: 'key_reuse_mismatch' });
               res.status(422).json({
                 error: 'Unprocessable Entity',
                 code: 'IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD',
@@ -198,6 +203,8 @@ export async function idempotencyMiddleware(
               return;
             }
 
+            transfersTotal.inc({ outcome: 'replay' });
+            idempotencyReplaysTotal.inc();
             res.setHeader('X-Idempotent-Replay', 'true');
             res.status(parsed.response_status).json(parsed.response_body);
             return;

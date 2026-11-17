@@ -4,9 +4,11 @@
 [![Node.js](https://img.shields.io/badge/Node.js-22-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
+[![Prometheus](https://img.shields.io/badge/Prometheus-Metrics-E6522C?logo=prometheus&logoColor=white)](https://prometheus.io/)
+[![Grafana](https://img.shields.io/badge/Grafana-Dashboards-F46800?logo=grafana&logoColor=white)](https://grafana.com/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/features/actions)
-[![Tests](https://img.shields.io/badge/Tests-88%2F88%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Tests-95%2F95%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **LedgerFlow** is an enterprise-grade, multi-tenant, idempotent double-entry financial ledger and webhook delivery engine that guarantees strict balance conservation (0 paise lost or created), zero-overdraft concurrency control, cryptographic API-key multi-tenancy, and at-least-once signed webhook dispatch with automatic crash recovery.
@@ -67,6 +69,9 @@ curl http://localhost:3000/health
 Interactive interfaces:
 - **Chaos Simulator & Webhook Dashboard:** [http://localhost:3000](http://localhost:3000)
 - **Interactive Swagger 3.0 API Docs:** [http://localhost:3000/docs](http://localhost:3000/docs)
+- **Grafana Observability Dashboard:** [http://localhost:3001](http://localhost:3001) *(Pre-provisioned, anonymous admin access)*
+- **Prometheus Scrape Target & Query UI:** [http://localhost:9090](http://localhost:9090)
+- **Prometheus Raw Metrics:** [http://localhost:3000/metrics](http://localhost:3000/metrics)
 
 ---
 
@@ -325,6 +330,32 @@ A single failing, slow, or malicious merchant endpoint must never degrade perfor
 - **Before/After Verification:**
   - Run `npm run demo:isolation` to execute the automated before/after demonstration comparing queue behavior and zero worker starvation.
 
+### 8. Enterprise Observability, Prometheus Metrics & Distributed Tracing
+LedgerFlow provides comprehensive, production-grade observability covering API latencies, queue dynamics, circuit breaker state, PostgreSQL pool health, and continuous double-entry mathematical conservation invariants.
+
+![LedgerFlow Production & Observability Overview](docs/images/grafana-dashboard.png)
+
+- **Pre-Configured Prometheus & Grafana Stack:**
+  - Launch with `docker compose up -d`: Prometheus scrapes `api:3000/metrics` every 5 seconds; Grafana auto-provisions the datasource and imports the pre-built `ledgerflow-overview` dashboard at [http://localhost:3001](http://localhost:3001) with anonymous admin access.
+- **Prometheus Metrics Reference (`GET /metrics`):**
+
+| Metric Name | Type | Labels | Description |
+| :--- | :--- | :--- | :--- |
+| `ledger_conservation_discrepancy_paise` | `Gauge` | — | **Double-entry invariant gauge.** Evaluates `SUM(DEBIT) - SUM(CREDIT)` across all transfers. **Strictly 0 paise at all times**; alerts on any non-zero value. |
+| `http_request_duration_seconds` | `Histogram` | `method`, `route`, `status_code` | HTTP request latencies partitioned across normalized routes (`:id` placeholder prevents cardinality explosion). |
+| `transfers_total` | `Counter` | `outcome` | Number of transfers processed by outcome (`created`, `replay`, `insufficient_funds`, `conflict`, `not_found`, `key_reuse_mismatch`). |
+| `idempotency_replays_total` | `Counter` | — | Total count of duplicate requests served safely from cache without re-executing transactions. |
+| `outbox_queue_depth` | `Gauge` | `status` | Real-time count of transactional outbox records partitioned by status (`PENDING`, `DELIVERED`, `DEAD_LETTER`). |
+| `webhook_delivery_duration_seconds` | `Histogram` | `status_code`, `endpoint_id` | Latency histogram for outbound partner webhook dispatches. |
+| `webhook_deliveries_total` | `Counter` | `result`, `endpoint_id` | Delivery outcomes (`success`, `failure`, `timeout_or_error`, `circuit_breaker_open`, `rate_limited`). |
+| `circuit_breaker_state` | `Gauge` | `endpoint_id` | Live circuit breaker state per partner endpoint (`0 = CLOSED`, `1 = HALF_OPEN`, `2 = OPEN`). |
+| `db_pool_connections` | `Gauge` | `state` | PostgreSQL connection pool saturation (`total`, `idle`, `waiting`). |
+
+- **End-to-End Distributed Tracing (`pino`):**
+  - High-performance structured JSON logging with request IDs (`X-Request-Id`).
+  - A client request ID is propagated from the Express API layer $\rightarrow$ PostgreSQL `outbox_events.request_id` $\rightarrow$ BullMQ worker job $\rightarrow$ PostgreSQL `delivery_attempts.request_id` $\rightarrow$ outbound webhook `X-Request-Id` partner header.
+  - Enables single-click distributed trace correlation from the initial transfer request all the way to individual webhook delivery attempts.
+
 ---
 
 ## API Reference
@@ -335,11 +366,12 @@ Interactive OpenAPI 3.0 documentation is available at [http://localhost:3000/doc
 | :--- | :--- | :--- | :--- |
 | `POST` | `/admin/merchants` | Admin bootstrap tenant & generate first API key | Header: `Authorization: Bearer <ADMIN_TOKEN>`<br/>Body: `{ name }` |
 | `GET` | `/health` | PostgreSQL & Redis health check (Public) | Returns status, latencies |
+| `GET` | `/metrics` | Prometheus metrics text format (Public) | Scraped by Prometheus; exposes all 9 business/system metrics |
 | `GET` | `/accounts` | List accounts scoped to authenticated merchant | Header: `Authorization: Bearer <api_key>` |
 | `POST` | `/accounts` | Create account with optional seed credit | Header: `Authorization: Bearer <api_key>`<br/>Body: `{ owner_name, currency, initial_credit_paise }` |
 | `GET` | `/accounts/:id` | Get account details & recent ledger entries | Header: `Authorization: Bearer <api_key>` |
 | `GET` | `/accounts/:id/ledger`| Get calculated balance & entry statement | Header: `Authorization: Bearer <api_key>` |
-| `POST` | `/transfers` | Atomic transfer; enqueues outbox events to registered endpoints | Headers: `Authorization: Bearer <api_key>`, `Idempotency-Key`<br/>Body: `{ from_account_id, to_account_id, amount_paise }` |
+| `POST` | `/transfers` | Atomic transfer; enqueues outbox events to registered endpoints | Headers: `Authorization: Bearer <api_key>`, `Idempotency-Key`, `X-Request-Id` (optional)<br/>Body: `{ from_account_id, to_account_id, amount_paise }` |
 | `GET` | `/webhook-endpoints` | List registered webhook endpoints with circuit breaker state | Header: `Authorization: Bearer <api_key>` |
 | `POST` | `/webhook-endpoints` | Register new webhook endpoint (SSRF validated) | Header: `Authorization: Bearer <api_key>`<br/>Body: `{ url, event_types, status }` |
 | `GET` | `/webhook-endpoints/:id` | Get endpoint with live circuit breaker status & rate limits | Header: `Authorization: Bearer <api_key>` |
@@ -365,7 +397,7 @@ LedgerFlow includes an automated CI pipeline defined in [`.github/workflows/ci.y
   2. `tsc --noEmit` (strict TypeScript type verification)
   3. `npm run migrate` (applies schema migrations)
   4. `npm run build` (builds production artifacts)
-  5. `npm test` (executes 88 Vitest integration test cases)
+  5. `npm test` (executes 95 Vitest integration test cases)
 
 ---
 

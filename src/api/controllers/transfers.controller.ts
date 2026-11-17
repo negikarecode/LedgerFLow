@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getClient } from '../../db/pool';
 import { redis } from '../../redis/client';
 import { env } from '../../config/env';
+import { transfersTotal, idempotencyReplaysTotal } from '../../observability/metrics';
 
 const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
 
@@ -68,6 +69,8 @@ export async function createTransfer(
           // Redis failure is non-fatal
         }
 
+        transfersTotal.inc({ outcome: 'replay' });
+        idempotencyReplaysTotal.inc();
         res.setHeader('X-Idempotent-Replay', 'true');
         res.status(stored.response_status).json(stored.response_body);
         return;
@@ -88,6 +91,7 @@ export async function createTransfer(
 
     if (lockResult.rows.length < 2) {
       await client.query('ROLLBACK');
+      transfersTotal.inc({ outcome: 'not_found' });
       res.status(404).json({
         error: 'Not Found',
         message: 'One or both accounts not found',
@@ -112,6 +116,7 @@ export async function createTransfer(
 
     if (currentBalance < amount_paise) {
       await client.query('ROLLBACK');
+      transfersTotal.inc({ outcome: 'insufficient_funds' });
       res.status(422).json({
         error: 'Unprocessable Entity',
         message: 'Insufficient funds',
@@ -136,6 +141,7 @@ export async function createTransfer(
     ]);
 
     const createdAt = ledgerResult.rows[0].created_at;
+    const requestId = (req as any).id || (req.headers['x-request-id'] as string) || null;
 
     // 4. Create one outbox_events row per ACTIVE endpoint of that merchant subscribed to 'transfer.completed'
     // inside the same transaction as the ledger entries.
@@ -159,12 +165,13 @@ export async function createTransfer(
         from_account_id,
         to_account_id,
         amount_paise,
+        request_id: requestId,
         created_at: createdAt,
       };
 
       const outboxInsertQuery = `
-        INSERT INTO outbox_events (id, event_type, payload, target_url, status, merchant_id, endpoint_id)
-        VALUES ($1, $2, $3, $4, 'PENDING', $5, $6)
+        INSERT INTO outbox_events (id, event_type, payload, target_url, status, merchant_id, endpoint_id, request_id)
+        VALUES ($1, $2, $3, $4, 'PENDING', $5, $6, $7)
         RETURNING id;
       `;
       const outboxResult = await client.query(outboxInsertQuery, [
@@ -174,6 +181,7 @@ export async function createTransfer(
         ep.url,
         merchantId,
         ep.id,
+        requestId,
       ]);
       outboxEventIds.push(outboxResult.rows[0].id);
     }
@@ -226,6 +234,21 @@ export async function createTransfer(
         // Non-fatal if Redis is down
         console.warn('[Transfers] Failed to cache response in Redis:', (redisErr as any)?.message);
       }
+    }
+
+    transfersTotal.inc({ outcome: 'created' });
+    if ((req as any).log) {
+      (req as any).log.info(
+        {
+          transaction_id: transactionId,
+          from_account_id,
+          to_account_id,
+          amount_paise,
+          outbox_events_count: outboxEventIds.length,
+          request_id: requestId,
+        },
+        'Transfer successfully created'
+      );
     }
 
     res.status(201).json(responseBody);

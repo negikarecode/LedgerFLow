@@ -10,6 +10,12 @@ import { cleanupExpiredIdempotencyKeys } from '../api/middlewares/idempotency';
 import { circuitBreaker, EndpointCircuitBreaker } from './circuit-breaker';
 import { rateLimiter, EndpointRateLimiter } from './rate-limiter';
 import { concurrencyLimiter, EndpointConcurrencyLimiter } from './concurrency-limiter';
+import { createWorkerLogger } from '../observability/logger';
+import {
+  webhookDeliveryDurationSeconds,
+  webhookDeliveriesTotal,
+  updateSystemMetrics,
+} from '../observability/metrics';
 
 export { circuitBreaker, rateLimiter, concurrencyLimiter };
 export { EndpointCircuitBreaker, EndpointRateLimiter, EndpointConcurrencyLimiter };
@@ -24,6 +30,7 @@ export interface WebhookDeliveryPayload {
   endpointId?: string;
   rateLimitPerSecond?: number;
   rateLimitBurst?: number;
+  requestId?: string;
 }
 
 export const QUEUE_NAME = 'webhook-delivery';
@@ -65,7 +72,7 @@ export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number
         ORDER BY ep_rank ASC, o.created_at ASC
         LIMIT $1
       )
-      SELECT o.id, o.event_type, o.target_url, o.payload, o.attempts, o.endpoint_id,
+      SELECT o.id, o.event_type, o.target_url, o.payload, o.attempts, o.endpoint_id, o.request_id,
              e.secret as endpoint_secret,
              e.rate_limit_per_second, e.rate_limit_burst
       FROM outbox_events o
@@ -107,6 +114,7 @@ export async function pollAndEnqueueOutboxEvents(batchSize = 20): Promise<number
           endpointId: row.endpoint_id,
           rateLimitPerSecond: row.rate_limit_per_second,
           rateLimitBurst: row.rate_limit_burst,
+          requestId: row.request_id || row.payload?.request_id,
         },
         {
           jobId: `${row.id}-${row.attempts}-${Date.now()}`,
@@ -143,6 +151,14 @@ export async function processOutboxDelivery(
   const startedAt = new Date();
   const startTime = performance.now();
   const deliveryId = uuidv4();
+  const reqId = data.requestId || data.payload?.request_id || null;
+
+  const workerLog = createWorkerLogger({
+    reqId: reqId || undefined,
+    eventId: data.eventId,
+    deliveryId,
+    endpointId: data.endpointId,
+  });
 
   let isProbe = false;
 
@@ -152,7 +168,12 @@ export async function processOutboxDelivery(
     const cbCheck = await circuitBreaker.canAttemptDelivery(data.endpointId);
     if (!cbCheck.allowed) {
       const delayMs = cbCheck.delayMs || 5000;
-      console.log(
+      webhookDeliveriesTotal.inc({
+        result: 'circuit_breaker_open',
+        endpoint_id: data.endpointId || 'none',
+      });
+      workerLog.warn(
+        { state: cbCheck.state, delayMs },
         `[Webhook Worker] Circuit breaker is ${cbCheck.state} for endpoint ${data.endpointId}. Rescheduling event ${data.eventId} in ${delayMs}ms without burning attempt.`
       );
       await query(
@@ -178,7 +199,12 @@ export async function processOutboxDelivery(
     );
     if (!rlCheck.allowed) {
       const delayMs = rlCheck.waitMs;
-      console.log(
+      webhookDeliveriesTotal.inc({
+        result: 'rate_limited',
+        endpoint_id: data.endpointId || 'none',
+      });
+      workerLog.warn(
+        { delayMs },
         `[Webhook Worker] Rate limit reached for endpoint ${data.endpointId}. Rescheduling event ${data.eventId} in ${delayMs}ms without burning attempt.`
       );
       await query(
@@ -246,6 +272,7 @@ export async function processOutboxDelivery(
           'X-LedgerFlow-Signature': signatureHeader,
           'X-LedgerFlow-Event-Id': data.eventId,
           'X-LedgerFlow-Delivery-Id': deliveryId,
+          ...(reqId ? { 'X-Request-Id': reqId } : {}),
         },
         timeoutMs: hardTimeoutMs,
       }),
@@ -278,6 +305,25 @@ export async function processOutboxDelivery(
       await circuitBreaker.recordFailure(data.endpointId, isProbe);
     }
   }
+
+  // Record Prometheus metrics
+  webhookDeliveryDurationSeconds.observe(
+    {
+      status_code: httpStatus ? httpStatus.toString() : 'error',
+      endpoint_id: data.endpointId || 'none',
+    },
+    durationMs / 1000
+  );
+
+  const deliveryResult = success
+    ? 'success'
+    : httpStatus
+    ? 'failure'
+    : 'timeout_or_error';
+  webhookDeliveriesTotal.inc({
+    result: deliveryResult,
+    endpoint_id: data.endpointId || 'none',
+  });
 
   const nextAttempts = data.attempts + 1;
   let nextRetryAt: Date | null = null;
@@ -315,13 +361,22 @@ export async function processOutboxDelivery(
     }
   }
 
+  if (success) {
+    workerLog.info({ httpStatus, durationMs }, 'Webhook delivered successfully');
+  } else {
+    workerLog.warn(
+      { httpStatus, durationMs, errorMessage, deadLetter },
+      'Webhook delivery attempt failed'
+    );
+  }
+
   // Record delivery attempt in delivery_attempts table
   try {
     await query(
       `INSERT INTO delivery_attempts (
         id, outbox_event_id, attempt_number, started_at, duration_ms,
-        http_status, error_message, request_signature, next_retry_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        http_status, error_message, request_signature, next_retry_at, request_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         deliveryId,
         data.eventId,
@@ -332,6 +387,7 @@ export async function processOutboxDelivery(
         errorMessage,
         signatureHeader,
         nextRetryAt,
+        reqId,
       ]
     );
   } catch (recordErr: any) {
@@ -428,9 +484,28 @@ export function startWebhookWorker(): {
 
   cleanupTimeout = setTimeout(runCleanup, 5000);
 
+  // Scheduled Periodic System Metrics Updater
+  let metricsRunning = true;
+  let metricsTimeout: NodeJS.Timeout | null = null;
+
+  const runMetrics = async () => {
+    if (!metricsRunning) return;
+    try {
+      await updateSystemMetrics();
+    } catch (err: any) {
+      // Non-fatal
+    }
+    if (metricsRunning) {
+      metricsTimeout = setTimeout(runMetrics, 15000);
+    }
+  };
+
+  metricsTimeout = setTimeout(runMetrics, 2000);
+
   const stop = async () => {
     pollerRunning = false;
     cleanupRunning = false;
+    metricsRunning = false;
     if (pollerTimeout) {
       clearTimeout(pollerTimeout);
       pollerTimeout = null;
@@ -438,6 +513,10 @@ export function startWebhookWorker(): {
     if (cleanupTimeout) {
       clearTimeout(cleanupTimeout);
       cleanupTimeout = null;
+    }
+    if (metricsTimeout) {
+      clearTimeout(metricsTimeout);
+      metricsTimeout = null;
     }
     await worker.close();
     await queue.close();

@@ -4,6 +4,8 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import path from 'path';
 import fs from 'fs';
+import { requestLogger } from '../observability/logger';
+import { metricsMiddleware, getMetricsHandler } from '../observability/metrics';
 import { healthRouter } from './routes/health.route';
 import { adminRouter } from './routes/admin.route';
 import { accountsRouter } from './routes/accounts.route';
@@ -26,10 +28,15 @@ export function createApp(): Express {
   );
   app.use(cors());
   app.use(express.json());
+  app.use(requestLogger);
+  app.use(metricsMiddleware);
 
   if (process.env.NODE_ENV !== 'test') {
     app.use(morgan('combined'));
   }
+
+  // Prometheus Metrics endpoint
+  app.get('/metrics', getMetricsHandler);
 
   // Static files for Chaos Simulator UI
   const candidateDirs = [
