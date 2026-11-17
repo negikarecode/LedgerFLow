@@ -100,8 +100,40 @@ LedgerFlow tests three distinct concurrency paradigms to provide honest, transpa
    - *Previous Bottleneck:* Every transfer performed `SELECT COALESCE(SUM(...)) FROM ledger_entries WHERE account_id = $1`, scanning all historical ledger entries sequentially under the lock.
    - *Fix Implemented:* Added a cached `balance_paise BIGINT NOT NULL DEFAULT 0` column on `accounts` with a database-level `CHECK (balance_paise >= 0)` constraint. Balances are updated in the *exact same transaction* under the existing `SELECT ... FOR UPDATE` lock in $O(1)$ time.
 2. **Continuous Account Balance Reconciliation:**
-   - Implemented `reconcileAccountBalances()` and `POST /admin/reconcile`. Periodically compares `accounts.balance_paise` with the immutable ledger `SUM` and double-entry debits/credits, alerting immediately on any discrepancy.
+   - Implemented `reconcileAccountBalances()` and `POST /admin/reconcile`. Periodically compares `accounts.balance_paise` with the immutable ledger `SUM` and double-entry debits/credits, alerting on any discrepancy.
 3. **Database Connection Pool Sizing:**
    - Increased PostgreSQL pool max to `60` (configured via `DB_POOL_MAX`) to allow up to 60 concurrent database transactions without socket timeouts.
 4. **Outbox Polling Index Optimization:**
    - Added a composite partial index `idx_outbox_events_pending_polling ON outbox_events(status, next_retry_at, created_at) WHERE status = 'PENDING'` for instant queue sweeps.
+
+---
+
+## 5. Honest Performance Analysis & Profiling Breakdown
+
+A critical review of the benchmark data reveals an important takeaway:
+- **Hot-Account Contention:** 62.1 req/s, p50 latency **4,839 ms** (concurrency 50).
+- **Realistic Multi-Account (Concurrency 10):** 58.0 req/s, p50 latency **135 ms**.
+- **Realistic Multi-Account (Concurrency 25):** 59.7 req/s, p50 latency **406 ms**.
+- **Realistic Multi-Account (Concurrency 50):** 44.4 req/s, p50 latency **1,009 ms**.
+
+### Why Didn't Throughput Scale 10x When Distributing Accounts?
+
+If row-lock contention were the *only* bottleneck, spreading traffic across 100 distinct account pairs should have increased throughput significantly. It did not: throughput remained between 44 and 62 req/s across all scenarios.
+
+**What Actually Happened:**
+1. **Contention Queuing vs. System Capacity:** Distributing traffic across 100 accounts eliminated **row-lock queuing**, which is why p50 latency dropped from **4,839 ms down to 135 ms** at concurrency 10. In Scenario 1, 50 in-flight requests were waiting in line for the *exact same* two row locks. In Scenario 2, requests rarely collided on the same accounts, so they executed without lock-wait delays.
+2. **The Real System Bottleneck:** System throughput is bounded by the CPU and sequential network I/O hops per transfer, rather than row locking:
+   - Each transfer request executes **11 sequential PostgreSQL queries** inside the transaction (`BEGIN`, `INSERT idempotency_keys ON CONFLICT`, `SELECT accounts FOR UPDATE`, `UPDATE from_account`, `UPDATE to_account`, 2x `INSERT ledger_entries`, `SELECT webhook_endpoints`, `INSERT outbox_events`, `UPDATE idempotency_keys`, `COMMIT`).
+   - Each transfer executes **4 Redis round-trips** (mutex acquisition `SET NX EX 30`, cache check, response caching, Lua compare-and-delete release).
+   - In addition, the single-threaded Node.js event loop performs recursive JSON key sorting and SHA-256 fingerprinting on every request.
+   - The entire stack (API server, background worker daemon, PostgreSQL 16, Redis 7, Prometheus scraping every 5s, and Grafana) ran concurrently on a single **dual-core 2011-era Intel Core i3-2120 CPU @ 3.30 GHz with 7.6 GB RAM**.
+3. **Execution Time Budget:** Under these conditions, each transfer consumes approximately **16–22 ms** of total serial I/O and processing time. On a single Node.js event loop with this database setup:
+   $$\text{Max Single-Thread Throughput} \approx \frac{1000\text{ ms}}{18\text{ ms}} \approx 55\text{ req/s}$$
+   This perfectly explains the observed 44–62 req/s ceiling across all workloads.
+
+### How to Scale Beyond 60 req/s
+To achieve 500+ req/s on larger infrastructure:
+1. **Consolidate SQL Statements:** Bundle the 11 sequential queries into a single PostgreSQL stored procedure (`plpgsql`) or multi-statement command to reduce 11 round-trips down to 1.
+2. **Node.js Clustering:** Run the Express API across all available CPU cores using Node.js `cluster` mode or PM2 to eliminate single-core event loop saturation.
+3. **Dedicated Database Host & PgBouncer:** Offload PostgreSQL to a separate host with PgBouncer connection pooling in transaction mode.
+

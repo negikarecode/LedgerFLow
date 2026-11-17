@@ -33,6 +33,11 @@ const envSchema = z.object({
   WEBHOOK_DELIVERY_TIMEOUT_MS: z.coerce.number().default(5000),
   WEBHOOK_WORKER_CONCURRENCY: z.coerce.number().default(10),
   DB_POOL_MAX: z.coerce.number().default(60),
+  DEMO_MODE: z
+    .string()
+    .optional()
+    .transform((val) => val === 'true'),
+  METRICS_TOKEN: z.string().optional(),
 });
 
 export const env = envSchema.parse(process.env);

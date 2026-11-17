@@ -1,0 +1,71 @@
+services:
+  # 1. API Web Service
+  - type: web
+    name: ledgerflow-api
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run build && npm run migrate
+    startCommand: npm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ledgerflow-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: ledgerflow-redis
+          property: connectionString
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: DEMO_MODE
+        value: "false"
+      - key: ALLOW_PRIVATE_WEBHOOK_TARGETS
+        value: "false"
+
+  # 2. Asynchronous Outbox Worker
+  - type: worker
+    name: ledgerflow-worker
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm run worker
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ledgerflow-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: ledgerflow-redis
+          property: connectionString
+      - key: ADMIN_TOKEN
+        fromService:
+          type: web
+          name: ledgerflow-api
+          envVarKey: ADMIN_TOKEN
+      - key: WEBHOOK_SECRET
+        fromService:
+          type: web
+          name: ledgerflow-api
+          envVarKey: WEBHOOK_SECRET
+      - key: ALLOW_PRIVATE_WEBHOOK_TARGETS
+        value: "false"
+
+# 3. Managed Datastores
+databases:
+  - name: ledgerflow-postgres
+    plan: starter
+    postgresMajorVersion: 16
+
+  - name: ledgerflow-redis
+    plan: starter

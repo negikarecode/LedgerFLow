@@ -226,8 +226,26 @@ export async function updateSystemMetrics(): Promise<void> {
 
 /**
  * Controller handler for GET /metrics.
+ * If METRICS_TOKEN is set in environment, requires Bearer token authentication.
  */
 export async function getMetricsHandler(req: Request, res: Response): Promise<void> {
+  const metricsToken = process.env.METRICS_TOKEN;
+  if (metricsToken) {
+    const authHeader = req.headers.authorization;
+    const queryToken = req.query.token as string | undefined;
+    const provided = authHeader?.startsWith('Bearer ')
+      ? authHeader.slice(7).trim()
+      : queryToken;
+
+    if (!provided || provided !== metricsToken) {
+      res.status(401).json({
+        error: 'UNAUTHORIZED',
+        message: 'Valid METRICS_TOKEN required to access metrics.',
+      });
+      return;
+    }
+  }
+
   await updateSystemMetrics();
   res.setHeader('Content-Type', metricsRegistry.contentType);
   res.send(await metricsRegistry.metrics());

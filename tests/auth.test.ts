@@ -358,4 +358,61 @@ describe('LedgerFlow Authentication & Multi-Tenancy Suite', () => {
       expect(replayB.body.transaction_id).toBe(resB.body.transaction_id);
     });
   });
+
+  describe('Demo Mode & Metrics Protection Gating', () => {
+    it('blocks demo routes with 403 when DEMO_MODE is disabled in non-test environment', async () => {
+      const origFlag = process.env.TEST_BLOCK_DEMO;
+      const origDemo = process.env.DEMO_MODE;
+      try {
+        process.env.TEST_BLOCK_DEMO = 'true';
+        process.env.DEMO_MODE = 'false';
+        (env as any).DEMO_MODE = false;
+        const res = await request(app).post('/demo/reset');
+        expect(res.status).toBe(403);
+        expect(res.body.error).toBe('DEMO_MODE_DISABLED');
+      } finally {
+        if (origFlag !== undefined) process.env.TEST_BLOCK_DEMO = origFlag;
+        else delete process.env.TEST_BLOCK_DEMO;
+        if (origDemo !== undefined) process.env.DEMO_MODE = origDemo;
+        else delete process.env.DEMO_MODE;
+        (env as any).DEMO_MODE = true;
+      }
+    });
+
+    it('enforces METRICS_TOKEN if configured in environment', async () => {
+      const origToken = process.env.METRICS_TOKEN;
+      try {
+        process.env.METRICS_TOKEN = 'secret-metrics-token-123';
+        
+        // 1. Without token: 401
+        const resUnauth = await request(app).get('/metrics');
+        expect(resUnauth.status).toBe(401);
+        expect(resUnauth.body.error).toBe('UNAUTHORIZED');
+
+        // 2. With invalid token: 401
+        const resBad = await request(app)
+          .get('/metrics')
+          .set('Authorization', 'Bearer wrong-token');
+        expect(resBad.status).toBe(401);
+
+        // 3. With valid token in Bearer header: 200
+        const resGood = await request(app)
+          .get('/metrics')
+          .set('Authorization', 'Bearer secret-metrics-token-123');
+        expect(resGood.status).toBe(200);
+        expect(resGood.text).toContain('ledgerflow_');
+
+        // 4. With valid token in query param: 200
+        const resQuery = await request(app)
+          .get('/metrics?token=secret-metrics-token-123');
+        expect(resQuery.status).toBe(200);
+      } finally {
+        if (origToken !== undefined) {
+          process.env.METRICS_TOKEN = origToken;
+        } else {
+          delete process.env.METRICS_TOKEN;
+        }
+      }
+    });
+  });
 });

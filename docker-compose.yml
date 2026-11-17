@@ -46,6 +46,8 @@ services:
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-default-ledgerflow-secret-key-12345}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-default-admin-token-secret-99999}
       ALLOW_PRIVATE_WEBHOOK_TARGETS: ${ALLOW_PRIVATE_WEBHOOK_TARGETS:-true}
+      DEMO_MODE: ${DEMO_MODE:-true}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
     ports:
       - "${PORT:-3000}:3000"
     volumes:
@@ -72,6 +74,8 @@ services:
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-default-ledgerflow-secret-key-12345}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-default-admin-token-secret-99999}
       ALLOW_PRIVATE_WEBHOOK_TARGETS: ${ALLOW_PRIVATE_WEBHOOK_TARGETS:-true}
+      DEMO_MODE: ${DEMO_MODE:-true}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
     volumes:
       - ./src:/app/src
       - /app/node_modules
@@ -108,8 +112,8 @@ services:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_ANONYMOUS_ENABLED=${GRAFANA_AUTH_ANONYMOUS_ENABLED:-false}
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=${GRAFANA_AUTH_ANONYMOUS_ROLE:-Viewer}
     volumes:
       - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro

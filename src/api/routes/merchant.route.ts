@@ -5,10 +5,14 @@ import {
   getMerchantStatus,
   resetMerchant,
 } from '../controllers/merchant.controller';
+import { requireDemoMode } from '../middlewares/demo.middleware';
 
 export const merchantRouter = Router();
 
+// Webhook receiver endpoint (accepts incoming signed payloads)
 merchantRouter.post('/mock-merchant/webhook', handleMerchantWebhook);
-merchantRouter.post('/mock-merchant/crash', toggleMerchantCrash);
-merchantRouter.get('/mock-merchant/status', getMerchantStatus);
-merchantRouter.post('/mock-merchant/reset', resetMerchant);
+
+// Simulation & destructive demo endpoints - gated behind DEMO_MODE
+merchantRouter.post('/mock-merchant/crash', requireDemoMode, toggleMerchantCrash);
+merchantRouter.get('/mock-merchant/status', requireDemoMode, getMerchantStatus);
+merchantRouter.post('/mock-merchant/reset', requireDemoMode, resetMerchant);
