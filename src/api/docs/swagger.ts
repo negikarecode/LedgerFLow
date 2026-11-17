@@ -306,7 +306,7 @@ export const openApiSpec = {
             },
           },
           '409': {
-            description: 'Request already in progress or idempotency key parameter mismatch',
+            description: 'Concurrent request already in progress with this idempotency key',
             content: {
               'application/json': {
                 schema: {
@@ -316,7 +316,7 @@ export const openApiSpec = {
             },
           },
           '422': {
-            description: 'Insufficient funds in sender account',
+            description: 'Insufficient funds or idempotency key reused with different request payload',
             content: {
               'application/json': {
                 schema: {

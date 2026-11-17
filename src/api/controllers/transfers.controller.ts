@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { getClient } from '../../db/pool';
 import { redis } from '../../redis/client';
+import { env } from '../../config/env';
 
 const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
 
@@ -18,6 +19,60 @@ export async function createTransfer(
 
   try {
     await client.query('BEGIN');
+
+    // 0. PostgreSQL Idempotency Lock & Durable Concurrency Guard (Source of Truth)
+    // Ensures absolute correctness even if the Redis lock expired mid-flight or Redis is down.
+    if (idempotency) {
+      const idempLockQuery = `
+        INSERT INTO idempotency_keys (key, merchant_id, request_hash, response_status, response_body, locked_at)
+        VALUES ($1, $2, $3, NULL, NULL, NOW())
+        ON CONFLICT (merchant_id, key) DO UPDATE
+          SET locked_at = idempotency_keys.locked_at
+        RETURNING key, request_hash, response_status, response_body;
+      `;
+      const idempResult = await client.query(idempLockQuery, [
+        idempotency.key,
+        merchantId,
+        idempotency.requestHash,
+      ]);
+
+      const stored = idempResult.rows[0];
+
+      // If already completed in a prior transaction or a concurrent transaction that just committed
+      if (stored && stored.response_status !== null) {
+        await client.query('ROLLBACK');
+
+        if (stored.request_hash !== idempotency.requestHash) {
+          res.status(422).json({
+            error: 'Unprocessable Entity',
+            code: 'IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD',
+            message:
+              'Idempotency key has already been used with a different request payload or endpoint',
+          });
+          return;
+        }
+
+        // Cache completed in Redis if Redis is available
+        try {
+          await redis.set(
+            idempotency.redisKey,
+            JSON.stringify({
+              request_hash: stored.request_hash,
+              response_status: stored.response_status,
+              response_body: stored.response_body,
+            }),
+            'EX',
+            env.IDEMPOTENCY_RETENTION_SECONDS
+          );
+        } catch {
+          // Redis failure is non-fatal
+        }
+
+        res.setHeader('X-Idempotent-Replay', 'true');
+        res.status(stored.response_status).json(stored.response_body);
+        return;
+      }
+    }
 
     // 1. Deadlock-free locking: Sort IDs alphabetically before SELECT FOR UPDATE
     // CRITICAL: Both accounts must belong to the authenticated merchant.
@@ -132,39 +187,42 @@ export async function createTransfer(
       created_at: createdAt,
     };
 
-    // 6. Save the 201 response in idempotency_keys inside the SAME transaction namespaced by merchant_id
+    // 6. Save the 201 response in idempotency_keys inside the SAME transaction
     if (idempotency) {
-      const idempotencyInsertQuery = `
-        INSERT INTO idempotency_keys (key, merchant_id, request_hash, response_status, response_body)
-        VALUES ($1, $2, $3, 201, $4)
-        ON CONFLICT (merchant_id, key) DO UPDATE SET
-          request_hash = EXCLUDED.request_hash,
-          response_status = EXCLUDED.response_status,
-          response_body = EXCLUDED.response_body;
+      const idempotencyUpdateQuery = `
+        UPDATE idempotency_keys
+        SET response_status = 201,
+            response_body = $1,
+            locked_at = NULL
+        WHERE merchant_id = $2 AND key = $3;
       `;
-      await client.query(idempotencyInsertQuery, [
-        idempotency.key,
-        merchantId,
-        idempotency.requestHash,
+      await client.query(idempotencyUpdateQuery, [
         JSON.stringify(responseBody),
+        merchantId,
+        idempotency.key,
       ]);
     }
 
     // 7. COMMIT PostgreSQL transaction
     await client.query('COMMIT');
 
-    // 8. Cache response in Redis (24h TTL)
+    // 8. Cache response in Redis (configurable retention, default 24h)
     if (idempotency) {
-      await redis.set(
-        idempotency.redisKey,
-        JSON.stringify({
-          request_hash: idempotency.requestHash,
-          response_status: 201,
-          response_body: responseBody,
-        }),
-        'EX',
-        86400
-      );
+      try {
+        await redis.set(
+          idempotency.redisKey,
+          JSON.stringify({
+            request_hash: idempotency.requestHash,
+            response_status: 201,
+            response_body: responseBody,
+          }),
+          'EX',
+          env.IDEMPOTENCY_RETENTION_SECONDS
+        );
+      } catch (redisErr) {
+        // Non-fatal if Redis is down
+        console.warn('[Transfers] Failed to cache response in Redis:', (redisErr as any)?.message);
+      }
     }
 
     res.status(201).json(responseBody);

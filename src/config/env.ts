@@ -20,6 +20,8 @@ const envSchema = z.object({
     .optional()
     .default('false')
     .transform((val) => val === 'true'),
+  IDEMPOTENCY_RETENTION_SECONDS: z.coerce.number().default(86400),
+  IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS: z.coerce.number().default(3600),
 });
 
 export const env = envSchema.parse(process.env);

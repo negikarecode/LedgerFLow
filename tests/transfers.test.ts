@@ -275,7 +275,7 @@ describe('LedgerFlow Phase 2 - Transfers & Transactional Outbox Suite', () => {
       expect(ledgerB.body.ledger_entries).toHaveLength(2); // initial credit + single credit
     });
 
-    it('should return 409 Conflict when same idempotency key is used with different payload', async () => {
+    it('should return 422 Unprocessable Entity when same idempotency key is used with different payload', async () => {
       const accA = await request(app)
         .post('/accounts')
         .set('Authorization', `Bearer ${DEMO_KEY}`)
@@ -319,9 +319,10 @@ describe('LedgerFlow Phase 2 - Transfers & Transactional Outbox Suite', () => {
           amount_paise: 20000, // Different amount!
         });
 
-      expect(res2.status).toBe(409);
-      expect(res2.body.error).toBe('Conflict');
-      expect(res2.body.message).toContain('already been used with different request parameters');
+      expect(res2.status).toBe(422);
+      expect(res2.body.error).toBe('Unprocessable Entity');
+      expect(res2.body.code).toBe('IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD');
+      expect(res2.body.message).toContain('different request payload');
     });
 
     it('should return 409 Conflict when a request with the same key is currently in progress', async () => {

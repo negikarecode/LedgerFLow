@@ -4,6 +4,7 @@ import { env } from '../config/env';
 import { getClient, query } from '../db/pool';
 import { signPayload } from './signature';
 import { dispatchSecureWebhook } from '../security/ssrf';
+import { cleanupExpiredIdempotencyKeys } from '../api/middlewares/idempotency';
 
 export interface WebhookDeliveryPayload {
   eventId: string;
@@ -225,11 +226,40 @@ export function startWebhookWorker(): {
 
   runPoller();
 
+  // Scheduled Idempotency Cleanup Poller
+  let cleanupRunning = true;
+  let cleanupTimeout: NodeJS.Timeout | null = null;
+
+  const runCleanup = async () => {
+    if (!cleanupRunning) return;
+    try {
+      const deletedCount = await cleanupExpiredIdempotencyKeys();
+      if (deletedCount > 0) {
+        console.log(`[Idempotency Cleanup] Pruned ${deletedCount} expired idempotency keys.`);
+      }
+    } catch (err: any) {
+      console.error('[Idempotency Cleanup] Error pruning expired keys:', err.message);
+    }
+    if (cleanupRunning) {
+      cleanupTimeout = setTimeout(
+        runCleanup,
+        env.IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS * 1000
+      );
+    }
+  };
+
+  cleanupTimeout = setTimeout(runCleanup, 5000);
+
   const stop = async () => {
     pollerRunning = false;
+    cleanupRunning = false;
     if (pollerTimeout) {
       clearTimeout(pollerTimeout);
       pollerTimeout = null;
+    }
+    if (cleanupTimeout) {
+      clearTimeout(cleanupTimeout);
+      cleanupTimeout = null;
     }
     await worker.close();
     await queue.close();

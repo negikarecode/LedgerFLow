@@ -6,7 +6,7 @@
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/features/actions)
-[![Tests](https://img.shields.io/badge/Tests-64%2F64%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Tests](https://img.shields.io/badge/Tests-73%2F73%20Passing-brightgreen?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **LedgerFlow** is an enterprise-grade, multi-tenant, idempotent double-entry financial ledger and webhook delivery engine that guarantees strict balance conservation (0 paise lost or created), zero-overdraft concurrency control, cryptographic API-key multi-tenancy, and at-least-once signed webhook dispatch with automatic crash recovery.
@@ -168,7 +168,7 @@ npm run benchmark
 └─────────┴────────────────────────────────┴──────────────────────────────┘
 ```
 
-### 2. Comprehensive Test Suite (64/64 Passing)
+### 2. Comprehensive Test Suite (73/73 Passing)
 LedgerFlow includes extensive automated integration, concurrency, security, and unit tests using **Vitest** and **Supertest**:
 
 ```bash
@@ -176,6 +176,15 @@ npm test
 ```
 
 ```
+ ✓ tests/idempotency.test.ts (9 tests)
+   ✓ Request Fingerprinting: SHA-256 (method + path + canonicalized body) with recursive key sorting
+   ✓ Key Reuse Guard: returns 422 IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD on parameter mismatch
+   ✓ Canonical Replay: returns 201 replay on reordered JSON keys
+   ✓ Safe Lock Release: owner token verified via Lua compare-and-delete script
+   ✓ Resilience: Redis flush mid-flight safely falls back to PostgreSQL durable store
+   ✓ Concurrency: 30s lock expiry with concurrent executors moves funds strictly once (0 double debit)
+   ✓ Fault Tolerance: Redis completely unavailable (requests correct via Postgres source of truth)
+   ✓ TTL Policy: cleans up records older than retention window (default 24h)
  ✓ tests/worker.test.ts (10 tests)
    ✓ Retry -> Recovery Pipeline: retries on merchant 500, recovers to DELIVERED on 200
  ✓ tests/auth.test.ts (15 tests)
@@ -197,9 +206,9 @@ npm test
    ✓ Race-Condition Stress: 50 concurrent transfers; zero overdraft guarantee
    ✓ Deadlock Prevention: opposite-direction transfers (A->B and B->A); zero PostgreSQL deadlocks
 
- Test Files  5 passed (5)
-      Tests  64 passed (64)
-   Duration  9.15s
+ Test Files  6 passed (6)
+      Tests  73 passed (73)
+   Duration  8.29s
 ```
 
 ---
@@ -229,11 +238,24 @@ await client.query(
 );
 ```
 
-### 3. Multi-Layer Idempotency Guard
-Idempotency ensures that network retries or accidental double-clicks never duplicate transfers:
-1. **Redis Fast-Lock (NX + EX):** An atomic `SET idemp:<key> LOCKED EX 30 NX` immediately rejects concurrent duplicate submissions with `409 Conflict`.
-2. **PostgreSQL Durable Store:** On commit, the original HTTP status and response payload are written to `idempotency_keys` inside the **same database transaction** as the ledger entries.
-3. **Subsequent Replays:** Return the cached response with header `X-Idempotent-Replay: true` in <2ms without touching the ledger.
+### 3. Hardened Multi-Tier Idempotency Guard (PostgreSQL Source of Truth)
+Idempotency ensures that network retries, timeouts, or accidental double-submissions never move money more than once:
+1. **Deterministic Request Fingerprinting:**
+   - Computes a SHA-256 fingerprint from `${method}:${path}:${canonicalized_body}`.
+   - Body canonicalization sorts all JSON object keys recursively at any nesting depth, ensuring that `{ a: 1, b: 2 }` and `{ b: 2, a: 1 }` evaluate to the identical fingerprint.
+   - If an existing key arrives with a mismatched fingerprint, the API immediately rejects the request with HTTP `422 Unprocessable Entity` (`IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD`).
+2. **Safe Distributed Lock Release (Compare-and-Delete Lua Script):**
+   - Fast-path distributed locking in Redis (`SET idemp:<merchant_id>:<key> <lock_payload> EX 30 NX`).
+   - Generates a random UUID owner token with each lock acquisition.
+   - Lock release executes via an atomic Lua script that compares the stored token against the caller's token before deleting, preventing expired locks from being inadvertently cleared by prior executors.
+3. **PostgreSQL as the Absolute Single Source of Truth:**
+   - Correctness **never depends on Redis**. Redis serves strictly as a latency optimization.
+   - At transaction start, the transfer engine executes an atomic `INSERT INTO idempotency_keys ... ON CONFLICT (merchant_id, key) DO UPDATE ... RETURNING ...`.
+   - If a Redis lock expires mid-flight or Redis is completely down, PostgreSQL row-level locks serialize concurrent executors: any secondary transaction waits for the primary transaction to commit, reads the committed 201 response, and returns an idempotent replay without executing ledger entries or moving funds.
+   - Insufficient funds (422) or not found (404) pre-checks rollback cleanly without consuming the idempotency key.
+4. **TTL Policy & Background Maintenance:**
+   - Configurable retention window (`IDEMPOTENCY_RETENTION_SECONDS`, default 24 hours).
+   - An automated background poller runs periodic scheduled pruning (`cleanupExpiredIdempotencyKeys()`) using indexed `created_at` timestamps to keep the durable store compact.
 
 ### 4. Transactional Outbox & Fan-Out Delivery
 Dual-write problems occur when an API writes to a database and publishes an event to an external service: if the network fails midway, systems desynchronize.
@@ -291,7 +313,7 @@ LedgerFlow includes an automated CI pipeline defined in [`.github/workflows/ci.y
   2. `tsc --noEmit` (strict TypeScript type verification)
   3. `npm run migrate` (applies schema migrations)
   4. `npm run build` (builds production artifacts)
-  5. `npm test` (executes 64 Vitest integration test cases)
+  5. `npm test` (executes 73 Vitest integration test cases)
 
 ---
 

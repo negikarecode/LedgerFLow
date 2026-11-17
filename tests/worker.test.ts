@@ -167,9 +167,11 @@ describe('LedgerFlow Phase 3 - Webhook Worker & Mock Merchant Suite', () => {
       const merchantStatus = await request(app).get('/mock-merchant/status');
       expect(merchantStatus.status).toBe(200);
       expect(merchantStatus.body.receivedEvents.length).toBeGreaterThanOrEqual(1);
-      expect(merchantStatus.body.receivedEvents[0].payload.transaction_id).toBe(
-        payload.transaction_id
+      const matchingEvent = merchantStatus.body.receivedEvents.find(
+        (e: any) => e.payload?.transaction_id === payload.transaction_id
       );
+      expect(matchingEvent).toBeDefined();
+      expect(matchingEvent.payload.transaction_id).toBe(payload.transaction_id);
     });
   });
 
