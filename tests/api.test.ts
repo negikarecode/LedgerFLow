@@ -91,6 +91,59 @@ describe('LedgerFlow API Suite', () => {
       expect(res.body.services.postgres.status).toBe('up');
       expect(res.body.services.redis.status).toBe('down');
     });
+
+    it('GET /health/live should return 200 OK even if Redis or PostgreSQL is down (liveness)', async () => {
+      const res = await request(app).get('/health/live');
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('ok');
+      expect(res.body.uptime_seconds).toBeDefined();
+
+      const aliasRes = await request(app).get('/livez');
+      expect(aliasRes.status).toBe(200);
+      expect(aliasRes.body.status).toBe('ok');
+    });
+
+    it('GET /health/ready should return 200 degraded when Redis is DOWN but PostgreSQL is UP (readiness)', async () => {
+      vi.spyOn(poolModule, 'checkDbHealth').mockResolvedValue({
+        status: 'up',
+        latencyMs: 1,
+      });
+      vi.spyOn(redisModule, 'checkRedisHealth').mockResolvedValue({
+        status: 'down',
+        latencyMs: 10,
+        error: 'Connection is closed.',
+      });
+
+      const res = await request(app).get('/health/ready');
+      expect(res.status).toBe(200);
+      expect(res.body.ready).toBe(true);
+      expect(res.body.degraded).toBe(true);
+      expect(res.body.status).toBe('degraded');
+      expect(res.body.services.postgres.status).toBe('up');
+      expect(res.body.services.redis.status).toBe('down');
+
+      const aliasRes = await request(app).get('/readyz');
+      expect(aliasRes.status).toBe(200);
+      expect(aliasRes.body.ready).toBe(true);
+    });
+
+    it('GET /health/ready should return 503 when required PostgreSQL is DOWN', async () => {
+      vi.spyOn(poolModule, 'checkDbHealth').mockResolvedValue({
+        status: 'down',
+        latencyMs: 5,
+        error: 'Postgres connection pool exhausted',
+      });
+      vi.spyOn(redisModule, 'checkRedisHealth').mockResolvedValue({
+        status: 'up',
+        latencyMs: 1,
+      });
+
+      const res = await request(app).get('/health/ready');
+      expect(res.status).toBe(503);
+      expect(res.body.ready).toBe(false);
+      expect(res.body.status).toBe('down');
+      expect(res.body.services.postgres.status).toBe('down');
+    });
   });
 
   describe('GET /docs', () => {

@@ -92,6 +92,45 @@ export const openApiSpec = {
         },
       },
     },
+    '/health/live': {
+      get: {
+        tags: ['Health'],
+        summary: 'Process liveness probe',
+        description: 'Verifies that the API server process is alive and responsive. Does not check external dependencies.',
+        responses: {
+          '200': {
+            description: 'Process is alive',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    status: { type: 'string', example: 'ok' },
+                    timestamp: { type: 'string', format: 'date-time' },
+                    uptime_seconds: { type: 'integer', example: 120 },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/health/ready': {
+      get: {
+        tags: ['Health'],
+        summary: 'Dependency readiness probe',
+        description: 'Verifies readiness to accept traffic. PostgreSQL is required; Redis failure operates in degraded mode.',
+        responses: {
+          '200': {
+            description: 'Ready to serve traffic (may be degraded if Redis is down)',
+          },
+          '503': {
+            description: 'Required dependency (PostgreSQL) is unavailable',
+          },
+        },
+      },
+    },
     '/accounts': {
       get: {
         tags: ['Accounts'],

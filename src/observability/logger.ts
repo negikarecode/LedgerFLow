@@ -14,6 +14,22 @@ declare global {
 
 export const logger = pino({
   level: process.env.LOG_LEVEL || (env.NODE_ENV === 'test' ? 'silent' : 'info'),
+  redact: {
+    paths: [
+      'req.headers.authorization',
+      'req.headers["x-ledgerflow-signature"]',
+      'secret',
+      '*.secret',
+      '*.*.secret',
+      'webhook_secret',
+      '*.webhook_secret',
+      'token',
+      '*.token',
+      'password',
+      '*.password',
+    ],
+    censor: '[Redacted]',
+  },
   formatters: {
     level(label) {
       return { level: label };

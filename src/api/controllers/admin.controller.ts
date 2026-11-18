@@ -84,6 +84,7 @@ export async function createMerchantKey(
   next: NextFunction
 ): Promise<void> {
   const { id } = req.params;
+  const { expires_at, expires_in_days } = req.body || {};
 
   try {
     const merchantCheck = await query('SELECT id, name FROM merchants WHERE id = $1', [id]);
@@ -95,15 +96,22 @@ export async function createMerchantKey(
       return;
     }
 
+    let calculatedExpiresAt: string | null = null;
+    if (expires_at) {
+      calculatedExpiresAt = new Date(expires_at).toISOString();
+    } else if (expires_in_days && typeof expires_in_days === 'number' && expires_in_days > 0) {
+      calculatedExpiresAt = new Date(Date.now() + expires_in_days * 86400000).toISOString();
+    }
+
     const { fullKey, prefix, hash } = generateApiKey();
     const keyId = uuidv4();
 
     const insertKeyQuery = `
-      INSERT INTO api_keys (id, merchant_id, key_prefix, key_hash)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id, key_prefix, created_at;
+      INSERT INTO api_keys (id, merchant_id, key_prefix, key_hash, expires_at)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, key_prefix, expires_at, created_at;
     `;
-    const keyResult = await query(insertKeyQuery, [keyId, id, prefix, hash]);
+    const keyResult = await query(insertKeyQuery, [keyId, id, prefix, hash, calculatedExpiresAt]);
     const keyRecord = keyResult.rows[0];
 
     res.status(201).json({
@@ -113,6 +121,7 @@ export async function createMerchantKey(
         key: fullKey,
         prefix: keyRecord.key_prefix,
         key_prefix: keyRecord.key_prefix,
+        expires_at: keyRecord.expires_at,
         created_at: keyRecord.created_at,
         warning: 'Store this API key safely now. It will never be shown again.',
       },
@@ -169,9 +178,19 @@ export async function handleAdminReconcile(
   next: NextFunction
 ): Promise<void> {
   try {
+    const rawMerchantId = req.body?.merchant_id ?? req.query?.merchant_id;
+    const rawAccountId = req.body?.account_id ?? req.query?.account_id;
     const autoRepair = req.body?.auto_repair === true;
+
+    const merchantId = typeof rawMerchantId === 'string' && rawMerchantId.trim() ? rawMerchantId.trim() : undefined;
+    const accountId = typeof rawAccountId === 'string' && rawAccountId.trim() ? rawAccountId.trim() : undefined;
+
     const { reconcileAccountBalances } = await import('../../services/reconciliation');
-    const report = await reconcileAccountBalances({ autoRepair });
+    const report = await reconcileAccountBalances({
+      autoRepair,
+      merchantId,
+      accountId,
+    });
     res.status(200).json(report);
   } catch (err) {
     next(err);

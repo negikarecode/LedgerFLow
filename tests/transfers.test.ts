@@ -156,15 +156,13 @@ describe('LedgerFlow Phase 2 - Transfers & Transactional Outbox Suite', () => {
 
       // 5. Verify Transactional Outbox inspection
       const outboxRes = await request(app)
-        .get('/outbox')
+        .get(`/outbox/${res.body.outbox_event_id}`)
         .set('Authorization', `Bearer ${DEMO_KEY}`);
       expect(outboxRes.status).toBe(200);
-      expect(outboxRes.body.data.length).toBeGreaterThanOrEqual(1);
 
-      const matchingEvent = outboxRes.body.data.find(
-        (e: any) => e.id === res.body.outbox_event_id
-      );
+      const matchingEvent = outboxRes.body;
       expect(matchingEvent).toBeDefined();
+      expect(matchingEvent.id).toBe(res.body.outbox_event_id);
       expect(matchingEvent.event_type).toBe('transfer.completed');
       expect(matchingEvent.status).toBe('PENDING');
       expect(matchingEvent.target_url).toBe('http://127.0.0.1:3000/mock-merchant/webhook');

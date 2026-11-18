@@ -56,8 +56,16 @@ LedgerFlow pairs BullMQ with a fair outbox poller running `ROW_NUMBER() OVER (PA
 
 ## 2. Core Invariants & Engineering Guarantees
 
-### Integer-Only Accounting (Paise, Not Floats)
+### Integer-Only Accounting (Paise, Not Floats) & Financial Invariants
 IEEE 754 floating-point arithmetic causes rounding errors (`0.1 + 0.2 === 0.30000000000000004`). LedgerFlow stores all amounts strictly as 64-bit integers (`BIGINT`) representing **paise** (1 INR = 100 paise; e.g. ₹500.25 = 50,025 paise).
+
+#### Safe Integer Ceiling & Precision Boundaries
+- **Application Safe Ceiling:** The application enforces a strict upper bound of `MAX_SAFE_PAISE = 9,007,199,254,740,991` paise (`Number.MAX_SAFE_INTEGER`, ₹90,071,992,547,409.91) for both individual transfer amounts and total account balances.
+- **Why Number.MAX_SAFE_INTEGER?** While PostgreSQL `BIGINT` supports up to $9.22 \times 10^{18}$, standard JSON parsers and JavaScript runtimes lose precision when deserializing integers beyond $2^{53}-1$ (e.g. `9007199254740992 + 1 === 9007199254740992`). Capping both transfers and balances at `Number.MAX_SAFE_INTEGER` ensures absolute lossless representation in all client JSON payloads, BigInt calculations, and database records.
+- **Database-Level Defense:** Migration `009_financial_invariants_and_bounds.sql` enforces `CHECK (balance_paise <= 9007199254740991)` and `CHECK (amount <= 9007199254740991)` at the PostgreSQL engine level.
+- **Double-Entry Zero-Sum Verification:** Every transfer generates exactly two entries in immutable `ledger_entries` (one `DEBIT` and one `CREDIT`). The transfer controller explicitly validates `credit.amount === debit.amount === transferAmount` and `credit.amount - debit.amount === 0n` before proceeding to webhook creation and commit. Any discrepancy aborts the transaction with an immediate rollback.
+- **Overflow & Underflow Prevention:** Sender balances are protected against negative values by both row-locked `fromBalance < transferAmount` checks and `CHECK (balance_paise >= 0)`. Recipient balances are guarded against overflow by `toBalance + transferAmount > MAX_SAFE_PAISE_BIGINT`, returning deterministic HTTP 422.
+- **Arbitrary-Precision Aggregate Calculations:** Reconciliation and metrics queries aggregate sums using PostgreSQL `::NUMERIC` rather than `::BIGINT` to prevent 64-bit integer overflow across high-volume ledger histories, and parse values using native `BigInt`.
 
 Balances are maintained as a cached `balance_paise BIGINT NOT NULL CHECK (balance_paise >= 0)` on the `accounts` table, updated atomically in the same transaction under row-level lock. All historical movements are recorded in an append-only `ledger_entries` table (`CREDIT` / `DEBIT`), with a continuous reconciliation job verifying that `accounts.balance_paise` equals `SUM(CREDIT) - SUM(DEBIT)` with zero discrepancy.
 

@@ -89,6 +89,11 @@ describe('LedgerFlow Observability & Metrics Suite', () => {
       expect(text).toContain('db_pool_connections');
       // 9. Double-Entry Ledger Conservation Discrepancy Gauge
       expect(text).toContain('ledger_conservation_discrepancy_paise');
+      // 10-13. Redis Resilience & Recovery Metrics
+      expect(text).toContain('redis_connected');
+      expect(text).toContain('redis_errors_total');
+      expect(text).toContain('idempotency_fallback_total');
+      expect(text).toContain('outbox_poller_errors_total');
     });
 
     it('should maintain double-entry ledger conservation invariant at exactly 0 paise', async () => {

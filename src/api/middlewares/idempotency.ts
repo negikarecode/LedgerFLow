@@ -4,7 +4,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { redis } from '../../redis/client';
 import { query } from '../../db/pool';
 import { env } from '../../config/env';
-import { transfersTotal, idempotencyReplaysTotal } from '../../observability/metrics';
+import { transfersTotal, idempotencyReplaysTotal, idempotencyFallbackTotal } from '../../observability/metrics';
+import { logger } from '../../observability/logger';
 
 const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
 
@@ -46,11 +47,24 @@ return 0
  * Safely releases a Redis distributed lock using a unique owner token.
  */
 export async function releaseSafeLock(redisKey: string, lockToken: string): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
   try {
-    const res = await redis.eval(COMPARE_AND_DEL_LUA, 1, redisKey, lockToken);
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Lock release timed out')), 1000);
+      timer.unref?.();
+    });
+    const res = await Promise.race([
+      redis.eval(COMPARE_AND_DEL_LUA, 1, redisKey, lockToken),
+      timeoutPromise,
+    ]);
+    if (timer) clearTimeout(timer);
     return res === 1;
   } catch (err) {
-    console.warn('[Idempotency] Failed to release lock safely:', (err as any)?.message);
+    if (timer) clearTimeout(timer);
+    logger.warn(
+      { event: 'idempotency_lock_release_failed', redisKey, error: (err as any)?.message },
+      `[Idempotency] Failed to release lock safely: ${(err as any)?.message}`
+    );
     return false;
   }
 }
@@ -131,7 +145,15 @@ export async function idempotencyMiddleware(
     return;
   }
 
-  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+  const isProduction = env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production';
+  const merchantId = req.merchant?.id || (!isProduction ? DEFAULT_DEMO_MERCHANT_ID : null);
+  if (!merchantId) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Merchant authentication required',
+    });
+    return;
+  }
   const trimmedKey = idempotencyKey.trim();
   const redisKey = `idemp:${merchantId}:${trimmedKey}`;
   const requestPath = (req.baseUrl + req.path).replace(/\/+$/, '') || '/';
@@ -157,7 +179,52 @@ export async function idempotencyMiddleware(
       const existingVal = await redis.get(redisKey);
 
       if (existingVal === 'LOCKED') {
-        // Legacy format lock in-flight
+        // Legacy format lock in-flight: check PostgreSQL before declaring conflict
+        try {
+          const dbCheck = await query(
+            `SELECT key, merchant_id, request_hash, response_status, response_body 
+             FROM idempotency_keys 
+             WHERE key = $1 AND merchant_id = $2`,
+            [trimmedKey, merchantId]
+          );
+
+          if (dbCheck.rows.length > 0 && dbCheck.rows[0].response_status !== null) {
+            const stored = dbCheck.rows[0];
+            if (stored.request_hash === requestFingerprint) {
+              if (redisAvailable) {
+                try {
+                  await redis.set(
+                    redisKey,
+                    JSON.stringify({
+                      request_hash: stored.request_hash,
+                      response_status: stored.response_status,
+                      response_body: stored.response_body,
+                    }),
+                    'EX',
+                    env.IDEMPOTENCY_RETENTION_SECONDS
+                  );
+                } catch {}
+              }
+              transfersTotal.inc({ outcome: 'replay' });
+              idempotencyReplaysTotal.inc();
+              res.setHeader('X-Idempotent-Replay', 'true');
+              res.status(stored.response_status).json(stored.response_body);
+              return;
+            } else {
+              transfersTotal.inc({ outcome: 'key_reuse_mismatch' });
+              res.status(422).json({
+                error: 'Unprocessable Entity',
+                code: 'IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD',
+                message:
+                  'Idempotency key has already been used with a different request payload or endpoint',
+              });
+              return;
+            }
+          }
+        } catch {
+          // If DB check fails, continue with default conflict response
+        }
+
         transfersTotal.inc({ outcome: 'conflict' });
         res.status(409).json({
           error: 'Conflict',
@@ -170,8 +237,55 @@ export async function idempotencyMiddleware(
         try {
           const parsed = JSON.parse(existingVal);
 
-          // Case A: Key is currently in flight
+          // Case A: Key is currently in flight according to Redis
           if (parsed.status === 'IN_FLIGHT') {
+            // First check if PostgreSQL already committed the transaction
+            // (e.g. process crashed or Redis cache update failed after commit)
+            try {
+              const dbCheck = await query(
+                `SELECT key, merchant_id, request_hash, response_status, response_body 
+                 FROM idempotency_keys 
+                 WHERE key = $1 AND merchant_id = $2`,
+                [trimmedKey, merchantId]
+              );
+
+              if (dbCheck.rows.length > 0 && dbCheck.rows[0].response_status !== null) {
+                const stored = dbCheck.rows[0];
+                if (stored.request_hash === requestFingerprint) {
+                  if (redisAvailable) {
+                    try {
+                      await redis.set(
+                        redisKey,
+                        JSON.stringify({
+                          request_hash: stored.request_hash,
+                          response_status: stored.response_status,
+                          response_body: stored.response_body,
+                        }),
+                        'EX',
+                        env.IDEMPOTENCY_RETENTION_SECONDS
+                      );
+                    } catch {}
+                  }
+                  transfersTotal.inc({ outcome: 'replay' });
+                  idempotencyReplaysTotal.inc();
+                  res.setHeader('X-Idempotent-Replay', 'true');
+                  res.status(stored.response_status).json(stored.response_body);
+                  return;
+                } else {
+                  transfersTotal.inc({ outcome: 'key_reuse_mismatch' });
+                  res.status(422).json({
+                    error: 'Unprocessable Entity',
+                    code: 'IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD',
+                    message:
+                      'Idempotency key has already been used with a different request payload or endpoint',
+                  });
+                  return;
+                }
+              }
+            } catch {
+              // If DB check fails, fall through to in-flight conflict logic
+            }
+
             if (parsed.request_hash && parsed.request_hash !== requestFingerprint) {
               transfersTotal.inc({ outcome: 'key_reuse_mismatch' });
               res.status(422).json({
@@ -216,9 +330,10 @@ export async function idempotencyMiddleware(
     }
   } catch (redisErr) {
     redisAvailable = false;
-    console.warn(
-      '[Idempotency] Redis unavailable, using PostgreSQL as single source of truth:',
-      (redisErr as any)?.message
+    idempotencyFallbackTotal.inc();
+    logger.warn(
+      { event: 'idempotency_redis_fallback', error: (redisErr as any)?.message },
+      `[Idempotency] Redis unavailable, using PostgreSQL as single source of truth: ${(redisErr as any)?.message}`
     );
   }
 
@@ -254,14 +369,35 @@ export async function idempotencyMiddleware(
             }
           }
 
+          transfersTotal.inc({ outcome: 'replay' });
+          idempotencyReplaysTotal.inc();
           res.setHeader('X-Idempotent-Replay', 'true');
           res.status(stored.response_status).json(stored.response_body);
           return;
         } else {
           // Fingerprint mismatch between request and stored durable record
-          if (redisAvailable && lockAcquired) {
+          if (redisAvailable) {
+            try {
+              // Cache the valid completed transfer in Redis so subsequent requests don't hit Postgres
+              await redis.set(
+                redisKey,
+                JSON.stringify({
+                  request_hash: stored.request_hash,
+                  response_status: stored.response_status,
+                  response_body: stored.response_body,
+                }),
+                'EX',
+                env.IDEMPOTENCY_RETENTION_SECONDS
+              );
+            } catch {
+              if (lockAcquired) {
+                await releaseSafeLock(redisKey, lockToken);
+              }
+            }
+          } else if (lockAcquired) {
             await releaseSafeLock(redisKey, lockToken);
           }
+          transfersTotal.inc({ outcome: 'key_reuse_mismatch' });
           res.status(422).json({
             error: 'Unprocessable Entity',
             code: 'IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD',
@@ -284,8 +420,11 @@ export async function idempotencyMiddleware(
     };
 
     // Safe lock cleanup on failure/rejection (HTTP status !== 201)
+    let lockReleased = false;
     const releaseLockOnFailure = async () => {
-      if (res.statusCode !== 201 && redisAvailable) {
+      if (lockReleased) return;
+      if (res.statusCode !== 201 && redisAvailable && lockAcquired) {
+        lockReleased = true;
         await releaseSafeLock(redisKey, lockToken);
       }
     };

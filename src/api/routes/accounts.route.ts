@@ -6,6 +6,7 @@ import {
   getAccountLedger,
 } from '../controllers/accounts.controller';
 import { requireApiKey } from '../middlewares/auth.middleware';
+import { tenantRateLimiter } from '../middlewares/rate-limit.middleware';
 import {
   validateBody,
   validateParams,
@@ -19,8 +20,8 @@ import { paginationQuerySchema } from '../schemas/common.schema';
 
 export const accountsRouter = Router();
 
-// Protect all account routes with API-key authentication
-accountsRouter.use('/accounts', requireApiKey);
+// Protect all account routes with API-key authentication and tenant rate limiting
+accountsRouter.use('/accounts', requireApiKey, tenantRateLimiter);
 
 accountsRouter.get(
   '/accounts',

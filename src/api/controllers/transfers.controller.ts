@@ -14,12 +14,56 @@ export async function createTransfer(
 ): Promise<void> {
   const { from_account_id, to_account_id, amount_paise } = req.body;
   const idempotency = req.idempotency;
-  const merchantId = req.merchant?.id || idempotency?.merchantId || DEFAULT_DEMO_MERCHANT_ID;
+  const isProduction = env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production';
+  const merchantId = req.merchant?.id || idempotency?.merchantId || (!isProduction ? DEFAULT_DEMO_MERCHANT_ID : null);
+  if (!merchantId) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Merchant authentication required',
+    });
+    return;
+  }
+
+  // 0a. Pre-flight check: Reject same-account transfers before database acquisition or locks
+  const rawFrom = from_account_id || req.body?.source_account_id;
+  const rawTo = to_account_id || req.body?.destination_account_id;
+  const fromNormalized = typeof rawFrom === 'string' ? rawFrom.trim().toLowerCase() : '';
+  const toNormalized = typeof rawTo === 'string' ? rawTo.trim().toLowerCase() : '';
+
+  if (fromNormalized && toNormalized && fromNormalized === toNormalized) {
+    transfersTotal.inc({ outcome: 'same_account_rejected' });
+    res.status(400).json({
+      error: 'Validation failed',
+      details: [
+        {
+          field: 'to_account_id',
+          message: 'from_account_id and to_account_id must not be the same',
+        },
+      ],
+    });
+    return;
+  }
 
   const client = await getClient();
 
   try {
     await client.query('BEGIN');
+
+    // 0b. Authoritative in-transaction check: Guarantee zero mutations for same-account transfers
+    if (fromNormalized === toNormalized) {
+      await client.query('ROLLBACK');
+      transfersTotal.inc({ outcome: 'same_account_rejected' });
+      res.status(400).json({
+        error: 'Validation failed',
+        details: [
+          {
+            field: 'to_account_id',
+            message: 'from_account_id and to_account_id must not be the same',
+          },
+        ],
+      });
+      return;
+    }
 
     // 0. PostgreSQL Idempotency Lock & Durable Concurrency Guard (Source of Truth)
     // Ensures absolute correctness even if the Redis lock expired mid-flight or Redis is down.
@@ -39,11 +83,27 @@ export async function createTransfer(
 
       const stored = idempResult.rows[0];
 
-      // If already completed in a prior transaction or a concurrent transaction that just committed
-      if (stored && stored.response_status !== null) {
-        await client.query('ROLLBACK');
-
+      if (stored) {
+        // If request_hash differs, this is a key reuse mismatch
         if (stored.request_hash !== idempotency.requestHash) {
+          await client.query('ROLLBACK');
+
+          if (idempotency.redisAvailable && stored.response_status !== null) {
+            try {
+              await redis.set(
+                idempotency.redisKey,
+                JSON.stringify({
+                  request_hash: stored.request_hash,
+                  response_status: stored.response_status,
+                  response_body: stored.response_body,
+                }),
+                'EX',
+                env.IDEMPOTENCY_RETENTION_SECONDS
+              );
+            } catch {}
+          }
+
+          transfersTotal.inc({ outcome: 'key_reuse_mismatch' });
           res.status(422).json({
             error: 'Unprocessable Entity',
             code: 'IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD',
@@ -53,34 +113,42 @@ export async function createTransfer(
           return;
         }
 
-        // Cache completed in Redis if Redis is available
-        try {
-          await redis.set(
-            idempotency.redisKey,
-            JSON.stringify({
-              request_hash: stored.request_hash,
-              response_status: stored.response_status,
-              response_body: stored.response_body,
-            }),
-            'EX',
-            env.IDEMPOTENCY_RETENTION_SECONDS
-          );
-        } catch {
-          // Redis failure is non-fatal
-        }
+        // If already completed in a prior transaction or a concurrent transaction that just committed
+        if (stored.response_status !== null) {
+          await client.query('ROLLBACK');
 
-        transfersTotal.inc({ outcome: 'replay' });
-        idempotencyReplaysTotal.inc();
-        res.setHeader('X-Idempotent-Replay', 'true');
-        res.status(stored.response_status).json(stored.response_body);
-        return;
+          // Cache completed in Redis if Redis is available
+          try {
+            await redis.set(
+              idempotency.redisKey,
+              JSON.stringify({
+                request_hash: stored.request_hash,
+                response_status: stored.response_status,
+                response_body: stored.response_body,
+              }),
+              'EX',
+              env.IDEMPOTENCY_RETENTION_SECONDS
+            );
+          } catch {
+            // Redis failure is non-fatal
+          }
+
+          transfersTotal.inc({ outcome: 'replay' });
+          idempotencyReplaysTotal.inc();
+          res.setHeader('X-Idempotent-Replay', 'true');
+          res.status(stored.response_status).json(stored.response_body);
+          return;
+        }
       }
     }
 
     // 1. Deadlock-free locking: Sort IDs alphabetically before SELECT FOR UPDATE
     // CRITICAL: Both accounts must belong to the authenticated merchant.
     // If one or both are missing or belong to another merchant, return 404 (never 403).
-    const [firstId, secondId] = [from_account_id, to_account_id].sort();
+    const [firstId, secondId] = [
+      fromNormalized || from_account_id,
+      toNormalized || to_account_id,
+    ].sort();
     const lockQuery = `
       SELECT id, merchant_id, balance_paise 
       FROM accounts 
@@ -99,18 +167,37 @@ export async function createTransfer(
       return;
     }
 
-    const fromAccount = lockResult.rows.find((r) => r.id === from_account_id);
-    const toAccount = lockResult.rows.find((r) => r.id === to_account_id);
+    const fromAccount = lockResult.rows.find(
+      (r) => r.id === from_account_id || r.id === fromNormalized
+    );
+    const toAccount = lockResult.rows.find(
+      (r) => r.id === to_account_id || r.id === toNormalized
+    );
 
-    // 2. Instant O(1) balance check from locked row (with DB-level non-negative constraint)
-    const currentBalance = Number(fromAccount.balance_paise);
+    // 2. Exact BigInt balance and overflow verification
+    const fromBalance = BigInt(fromAccount.balance_paise);
+    const toBalance = BigInt(toAccount.balance_paise);
+    const transferAmount = BigInt(amount_paise);
 
-    if (currentBalance < amount_paise) {
+    if (fromBalance < transferAmount) {
       await client.query('ROLLBACK');
       transfersTotal.inc({ outcome: 'insufficient_funds' });
       res.status(422).json({
         error: 'Unprocessable Entity',
         message: 'Insufficient funds',
+      });
+      return;
+    }
+
+    const MAX_SAFE_PAISE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+
+    // Guard against recipient balance overflow beyond Number.MAX_SAFE_INTEGER
+    if (toBalance + transferAmount > MAX_SAFE_PAISE_BIGINT) {
+      await client.query('ROLLBACK');
+      transfersTotal.inc({ outcome: 'balance_overflow' });
+      res.status(422).json({
+        error: 'Unprocessable Entity',
+        message: 'Transfer would exceed maximum supported account balance',
       });
       return;
     }
@@ -145,6 +232,29 @@ export async function createTransfer(
       to_account_id,
       amount_paise,
     ]);
+
+    // Verify double-entry accounting invariants: exactly 2 entries (DEBIT and CREDIT) balancing to zero
+    if (ledgerResult.rows.length !== 2) {
+      throw new Error(
+        `Double-entry invariant violation: expected 2 ledger entries, got ${ledgerResult.rows.length}`
+      );
+    }
+    const debitEntry = ledgerResult.rows.find((r) => r.entry_type === 'DEBIT');
+    const creditEntry = ledgerResult.rows.find((r) => r.entry_type === 'CREDIT');
+    if (!debitEntry || !creditEntry) {
+      throw new Error('Double-entry invariant violation: missing DEBIT or CREDIT entry');
+    }
+    const debitAmount = BigInt(debitEntry.amount);
+    const creditAmount = BigInt(creditEntry.amount);
+    if (
+      debitAmount !== transferAmount ||
+      creditAmount !== transferAmount ||
+      creditAmount - debitAmount !== 0n
+    ) {
+      throw new Error(
+        'Double-entry invariant violation: DEBIT and CREDIT entries do not balance to zero'
+      );
+    }
 
     const createdAt = ledgerResult.rows[0].created_at;
     const requestId = (req as any).id || (req.headers['x-request-id'] as string) || null;

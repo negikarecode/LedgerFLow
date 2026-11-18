@@ -1,11 +1,15 @@
 import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { env } from '../config/env';
 
+const isProduction = env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production';
+const enableSsl = env.DATABASE_SSL === 'true' || (isProduction && env.DATABASE_URL.includes('sslmode=require'));
+
 export const pool = new Pool({
   connectionString: env.DATABASE_URL,
   max: env.DB_POOL_MAX,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
+  ...(enableSsl ? { ssl: { rejectUnauthorized: env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' } } : {}),
 });
 
 pool.on('error', (err) => {

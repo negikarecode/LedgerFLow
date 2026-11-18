@@ -30,6 +30,8 @@ Authorization: Bearer <METRICS_TOKEN>
 | `POST` | `/admin/merchants` | Admin | Create merchant and generate initial API key |
 | `POST` | `/admin/reconcile` | Admin | Trigger full balance reconciliation against ledger |
 | `GET` | `/health` | Public | Service health and component latency check |
+| `GET` | `/health/live` | Public | Liveness probe (verifies process is running) |
+| `GET` | `/health/ready` | Public | Readiness probe (verifies PostgreSQL; handles Redis degraded mode) |
 | `GET` | `/metrics` | Public / Token | Prometheus metrics text endpoint |
 | `GET` | `/accounts` | Merchant | List accounts scoped to the authenticated tenant |
 | `POST` | `/accounts` | Merchant | Create a new financial account with initial balance |
@@ -79,7 +81,32 @@ curl -X POST http://localhost:3000/transfers \
 }
 ```
 
-*Subsequent identical requests with the same `Idempotency-Key` return the identical 201 response with `X-Idempotent-Replay: true` header without moving funds.*
+*Subsequent identical requests with the same `Idempotency-Key` return the identical 201 response with `X-Idempotent-Replay: true` header without moving funds. See [docs/IDEMPOTENCY.md](file:///home/aryan/LedgerFlow/docs/IDEMPOTENCY.md) for full contract specifications.*
+
+---
+
+### Financial Amount Validation & Accounting Rules
+
+All monetary values across LedgerFlow are strictly represented as **positive integer paise** (1 INR = 100 paise; ₹1.00 = 100 paise). Floating-point values, decimals, strings, negative numbers, zero, NaN, Infinity, and unsafe JavaScript integers are deterministically rejected.
+
+#### Numeric Representation & Limits
+- **Unit:** Integer Paise (`amount_paise`, `balance_paise`, `initial_credit_paise`).
+- **Minimum Transfer Amount:** `1` paise (₹0.01). Amounts `<= 0` return `400 Bad Request`.
+- **Maximum Safe Amount:** `9,007,199,254,740,991` paise (`Number.MAX_SAFE_INTEGER`, ₹90,071,992,547,409.91).
+- **PostgreSQL Column Type:** `BIGINT` (64-bit integer, max $9.22 \times 10^{18}$) with DB check constraints `balance_paise <= 9007199254740991` and `amount <= 9007199254740991`.
+- **Overflow Protection:** If a transfer would cause the recipient account balance to exceed `9,007,199,254,740,991` paise, the API returns `422 Unprocessable Entity` (`Transfer would exceed maximum supported account balance`) and rolls back all mutations atomically.
+- **Double-Entry Zero-Sum Invariant:** Every transfer atomically inserts exactly one `DEBIT` and one `CREDIT` of equal value into immutable `ledger_entries`, guaranteeing $\sum \text{CREDIT} - \sum \text{DEBIT} = 0$.
+
+#### Rejection Matrix
+| Input | Example | HTTP Status | Response Error |
+| :--- | :--- | :--- | :--- |
+| Negative amount | `-100` | `400` | `Validation failed: amount_paise must be greater than 0` |
+| Zero amount | `0` | `400` | `Validation failed: amount_paise must be greater than 0` |
+| Floating point / decimal | `10.50`, `0.99` | `400` | `Validation failed: amount_paise must be an integer` |
+| Ambiguous strings | `"1000"`, `"₹50"`, `"$10"` | `400` | `Validation failed: amount_paise must be a valid number` |
+| Unsafe JavaScript integer | `9007199254740992`, `1e20` | `400` | `Validation failed: amount_paise must not exceed 9007199254740991` |
+| Insufficient funds | `sender.balance < amount` | `422` | `Unprocessable Entity: Insufficient funds` |
+| Recipient balance overflow | `receiver.balance + amount > MAX` | `422` | `Unprocessable Entity: Transfer would exceed maximum supported account balance` |
 
 ---
 
@@ -112,15 +139,48 @@ curl -X POST http://localhost:3000/webhook-endpoints \
 
 ---
 
+### 3. Independent Balance Reconciliation & Audit
+Trigger an authoritative, read-only verification of account balances and double-entry invariants inside snapshot isolation (`REPEATABLE READ READ ONLY`). See [docs/RECONCILIATION.md](file:///home/aryan/LedgerFlow/docs/RECONCILIATION.md) for full operator runbook.
+
+```bash
+curl -X POST http://localhost:3000/admin/reconcile \
+  -H "Authorization: Bearer default-admin-token-secret-99999" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "merchant_id": "00000000-0000-0000-0000-000000000001",
+    "account_id": "a1b2c3d4-0000-0000-0000-000000000001",
+    "auto_repair": false
+  }'
+```
+
+**Response (`200 OK`):**
+```json
+{
+  "timestamp": "2026-11-18T12:05:00.000Z",
+  "total_accounts_checked": 1,
+  "total_transactions_checked": 25,
+  "discrepancies_found": 0,
+  "integrity_violations_found": 0,
+  "discrepancies": [],
+  "integrity_violations": [],
+  "double_entry_net_discrepancy_paise": 0,
+  "status": "HEALTHY"
+}
+```
+
+---
+
 ## Error Codes Reference
 
 | HTTP Code | Error Code | Description |
 | :--- | :--- | :--- |
+| `400` | `VALIDATION_FAILED` | Request schema violation (malformed UUID, negative/float/unsafe amount, missing required headers). |
 | `401` | `UNAUTHORIZED` | Missing or invalid API key / admin token. |
 | `403` | `DEMO_MODE_DISABLED` | Attempted to call `/demo/reset` or `/mock-merchant/*` when `DEMO_MODE=false`. |
 | `404` | `NOT_FOUND` | Resource not found or owned by a different merchant. |
 | `409` | `IDEMPOTENT_OPERATION_IN_PROGRESS` | Concurrent identical request currently executing. |
 | `422` | `INSUFFICIENT_FUNDS` | Sender account has insufficient balance to complete debit. |
+| `422` | `BALANCE_OVERFLOW` | Transfer would exceed maximum supported account balance (`9,007,199,254,740,991` paise). |
 | `422` | `IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD` | Idempotency key reused with mismatched request parameters. |
 | `422` | `SSRF_VALIDATION_FAILED` | Target URL resolved to a private, loopback, or metadata address. |
 | `429` | `RATE_LIMITED` | Endpoint token bucket capacity exceeded. |

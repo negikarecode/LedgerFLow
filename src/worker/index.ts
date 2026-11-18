@@ -1,7 +1,7 @@
 import { Worker, Job, Queue } from 'bullmq';
 import { v4 as uuidv4 } from 'uuid';
 import { performance } from 'perf_hooks';
-import { getRedisClient } from '../redis/client';
+import { getRedisClient, createBullMQRedisClient, calculateRedisBackoff } from '../redis/client';
 import { env } from '../config/env';
 import { getClient, query } from '../db/pool';
 import { signPayload } from './signature';
@@ -10,11 +10,12 @@ import { cleanupExpiredIdempotencyKeys } from '../api/middlewares/idempotency';
 import { circuitBreaker, EndpointCircuitBreaker } from './circuit-breaker';
 import { rateLimiter, EndpointRateLimiter } from './rate-limiter';
 import { concurrencyLimiter, EndpointConcurrencyLimiter } from './concurrency-limiter';
-import { createWorkerLogger } from '../observability/logger';
+import { createWorkerLogger, logger } from '../observability/logger';
 import {
   webhookDeliveryDurationSeconds,
   webhookDeliveriesTotal,
   updateSystemMetrics,
+  outboxPollerErrorsTotal,
 } from '../observability/metrics';
 
 export { circuitBreaker, rateLimiter, concurrencyLimiter };
@@ -39,8 +40,15 @@ let webhookQueueInstance: Queue<WebhookDeliveryPayload> | null = null;
 
 export function getWebhookQueue(): Queue<WebhookDeliveryPayload> {
   if (!webhookQueueInstance) {
+    const queueConn = createBullMQRedisClient();
     webhookQueueInstance = new Queue<WebhookDeliveryPayload>(QUEUE_NAME, {
-      connection: getRedisClient(),
+      connection: queueConn,
+    });
+    webhookQueueInstance.on('error', (err: Error) => {
+      logger.error(
+        { event: 'bullmq_queue_error', error: err.message },
+        `[BullMQ Queue] Connection/Queue error: ${err.message}`
+      );
     });
   }
   return webhookQueueInstance;
@@ -51,8 +59,15 @@ export function getWebhookQueue(): Queue<WebhookDeliveryPayload> {
  * with FOR UPDATE SKIP LOCKED and enqueues them into BullMQ.
  */
 export async function pollAndEnqueueOutboxEvents(batchSize = 100): Promise<number> {
-  const client = await getClient();
   const queue = getWebhookQueue();
+
+  // Guard: if Queue Redis connection is not ready, avoid leasing database rows that cannot be enqueued
+  const queueConn = (queue as any).opts?.connection || getRedisClient();
+  if (queueConn && typeof queueConn.status === 'string' && queueConn.status !== 'ready') {
+    return 0;
+  }
+
+  const client = await getClient();
 
   try {
     await client.query('BEGIN');
@@ -248,7 +263,7 @@ export async function processOutboxDelivery(
   };
   const payloadString = JSON.stringify(outgoingPayload);
   const signingSecret = data.secret || env.WEBHOOK_SECRET;
-  const { signatureHeader } = signPayload(payloadString, signingSecret);
+  const { signatureHeader } = signPayload(payloadString, signingSecret, { deliveryId });
 
   let success = false;
   let httpStatus: number | null = null;
@@ -410,13 +425,14 @@ export function startWebhookWorker(): {
   queue: Queue<WebhookDeliveryPayload>;
   stop: () => Promise<void>;
 } {
-  const connection = getRedisClient();
+  const connection = createBullMQRedisClient();
   const queue = getWebhookQueue();
 
   const worker = new Worker<WebhookDeliveryPayload>(
     QUEUE_NAME,
     async (job: Job<WebhookDeliveryPayload>) => {
-      console.log(
+      logger.info(
+        { event: 'webhook_worker_job_start', eventId: job.data.eventId, targetUrl: job.data.targetUrl },
         `[Webhook Worker] Processing event ${job.data.eventId} -> ${job.data.targetUrl}`
       );
       return await processOutboxDelivery(job.data);
@@ -428,35 +444,64 @@ export function startWebhookWorker(): {
   );
 
   worker.on('ready', () => {
-    console.log(`[Webhook Worker] Listening for jobs on '${QUEUE_NAME}' with concurrency ${env.WEBHOOK_WORKER_CONCURRENCY}...`);
+    logger.info(
+      { event: 'webhook_worker_ready', queue: QUEUE_NAME, concurrency: env.WEBHOOK_WORKER_CONCURRENCY },
+      `[Webhook Worker] Listening for jobs on '${QUEUE_NAME}' with concurrency ${env.WEBHOOK_WORKER_CONCURRENCY}...`
+    );
   });
 
   worker.on('completed', (job: Job) => {
-    console.log(`[Webhook Worker] Job ${job.id} completed.`);
+    logger.info(
+      { event: 'webhook_worker_job_completed', jobId: job.id },
+      `[Webhook Worker] Job ${job.id} completed.`
+    );
   });
 
   worker.on('failed', (job: Job | undefined, err: Error) => {
-    console.error(`[Webhook Worker] Job ${job?.id} failed: ${err.message}`);
+    logger.error(
+      { event: 'webhook_worker_job_failed', jobId: job?.id, error: err.message },
+      `[Webhook Worker] Job ${job?.id} failed: ${err.message}`
+    );
   });
 
   worker.on('error', (err: Error) => {
-    console.error('[Webhook Worker] Unexpected worker error:', err);
+    logger.error(
+      { event: 'webhook_worker_error', error: err.message },
+      `[Webhook Worker] Unexpected worker error: ${err.message}`
+    );
   });
 
   let pollerRunning = true;
   let pollerTimeout: NodeJS.Timeout | null = null;
+  let consecutiveErrors = 0;
 
   const runPoller = async () => {
     if (!pollerRunning) return;
     let nextDelay = 1000;
     try {
       const enqueued = await pollAndEnqueueOutboxEvents(100);
+      consecutiveErrors = 0;
       // Adaptive backoff: if events were enqueued, poll immediately (50ms) to drain backlog without latency
       if (enqueued > 0) {
         nextDelay = 50;
       }
     } catch (err: any) {
-      console.error('[Outbox Poller] Error during poll cycle:', err.message);
+      consecutiveErrors++;
+      outboxPollerErrorsTotal.inc();
+      nextDelay = calculateRedisBackoff(consecutiveErrors, {
+        baseDelayMs: 1000,
+        maxDelayMs: 10000,
+        jitterRatio: 0.3,
+      });
+      logger.error(
+        {
+          event: 'outbox_poller_error',
+          consecutive_errors: consecutiveErrors,
+          next_retry_delay_ms: nextDelay,
+          error: err.message,
+        },
+        `[Outbox Poller] Error during poll cycle: ${err.message}. Backing off for ${nextDelay}ms`
+      );
     }
     if (pollerRunning) {
       pollerTimeout = setTimeout(runPoller, nextDelay);
@@ -474,10 +519,16 @@ export function startWebhookWorker(): {
     try {
       const deletedCount = await cleanupExpiredIdempotencyKeys();
       if (deletedCount > 0) {
-        console.log(`[Idempotency Cleanup] Pruned ${deletedCount} expired idempotency keys.`);
+        logger.info(
+          { event: 'idempotency_cleanup', deleted_count: deletedCount },
+          `[Idempotency Cleanup] Pruned ${deletedCount} expired idempotency keys.`
+        );
       }
     } catch (err: any) {
-      console.error('[Idempotency Cleanup] Error pruning expired keys:', err.message);
+      logger.error(
+        { event: 'idempotency_cleanup_error', error: err.message },
+        `[Idempotency Cleanup] Error pruning expired keys: ${err.message}`
+      );
     }
     if (cleanupRunning) {
       cleanupTimeout = setTimeout(
@@ -523,8 +574,31 @@ export function startWebhookWorker(): {
       clearTimeout(metricsTimeout);
       metricsTimeout = null;
     }
-    await worker.close();
-    await queue.close();
+
+    try {
+      await Promise.race([
+        worker.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Worker close timeout')), 2000)),
+      ]);
+    } catch (err: any) {
+      logger.warn(
+        { event: 'worker_close_warning', error: err.message },
+        `[Webhook Worker] Worker close error or timeout: ${err.message}`
+      );
+    }
+
+    try {
+      await Promise.race([
+        queue.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Queue close timeout')), 2000)),
+      ]);
+    } catch (err: any) {
+      logger.warn(
+        { event: 'queue_close_warning', error: err.message },
+        `[Webhook Worker] Queue close error or timeout: ${err.message}`
+      );
+    }
+
     webhookQueueInstance = null;
   };
 

@@ -5,6 +5,19 @@ import { env } from '../../config/env';
 
 const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
 
+function getEffectiveMerchantId(req: Request, res: Response): string | null {
+  const isProduction = env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production';
+  const merchantId = req.merchant?.id || (!isProduction ? DEFAULT_DEMO_MERCHANT_ID : null);
+  if (!merchantId) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Merchant authentication required',
+    });
+    return null;
+  }
+  return merchantId;
+}
+
 interface CursorData {
   created_at: string;
   id: string;
@@ -37,7 +50,8 @@ export async function listOutboxEvents(
   next: NextFunction
 ): Promise<void> {
   try {
-    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+    const merchantId = getEffectiveMerchantId(req, res);
+    if (!merchantId) return;
     const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
     const status = req.query.status as string | undefined;
     const endpointId = req.query.endpoint_id as string | undefined;
@@ -157,7 +171,8 @@ export async function getOutboxEvent(
 ): Promise<void> {
   try {
     const { id } = req.params;
-    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+    const merchantId = getEffectiveMerchantId(req, res);
+    if (!merchantId) return;
 
     const eventResult = await query(
       `SELECT id, merchant_id, endpoint_id, event_type, payload, target_url, status, attempts, next_retry_at, created_at
@@ -227,7 +242,8 @@ export async function replayOutboxEvent(
 ): Promise<void> {
   try {
     const { id } = req.params;
-    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+    const merchantId = getEffectiveMerchantId(req, res);
+    if (!merchantId) return;
 
     // Check ownership and current status
     const checkResult = await query(
@@ -323,7 +339,8 @@ export async function replayBatchOutboxEvents(
   next: NextFunction
 ): Promise<void> {
   try {
-    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+    const merchantId = getEffectiveMerchantId(req, res);
+    if (!merchantId) return;
     const { endpoint_id } = req.body;
 
     if (!endpoint_id || typeof endpoint_id !== 'string') {

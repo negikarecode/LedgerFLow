@@ -7,6 +7,15 @@ import { env } from '../../config/env';
  * actions in production deployments.
  */
 export function requireDemoMode(req: Request, res: Response, next: NextFunction): void {
+  const isProduction = env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production';
+  if (isProduction) {
+    res.status(403).json({
+      error: 'DEMO_MODE_FORBIDDEN_IN_PRODUCTION',
+      message: 'Demo and simulation endpoints are strictly forbidden in production environments.',
+    });
+    return;
+  }
+
   const isDemo = (env.DEMO_MODE || process.env.DEMO_MODE === 'true') && process.env.DEMO_MODE !== 'false';
   if (isDemo || (process.env.NODE_ENV === 'test' && process.env.TEST_BLOCK_DEMO !== 'true')) {
     return next();

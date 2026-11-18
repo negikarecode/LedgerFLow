@@ -1,0 +1,112 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledgerflow_prod_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in production}
+      POSTGRES_DB: ${POSTGRES_DB:-ledgerflow}
+    # Security: Database port is intentionally NOT exposed to the host network in production.
+    # It is accessible only internally over the isolated Docker bridge network.
+    expose:
+      - "5432"
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+      - ./src/db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-ledgerflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ledgerflow_prod_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: ledgerflow_prod_redis
+    restart: always
+    # Security: Redis port is intentionally NOT exposed to the host network in production.
+    # It is accessible only internally over the isolated Docker bridge network.
+    expose:
+      - "6379"
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - ledgerflow_prod_net
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: ledgerflow_prod_api
+    restart: always
+    user: "node"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ledgerflow}
+      REDIS_URL: redis://redis:6379
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?WEBHOOK_SECRET is required in production}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN is required in production}
+      ALLOW_PRIVATE_WEBHOOK_TARGETS: "false"
+      DEMO_MODE: "false"
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    ports:
+      # Bound to localhost so reverse proxy (Caddy / Nginx / Cloudflare Tunnel) can terminate TLS
+      - "127.0.0.1:${PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/health/ready', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ledgerflow_prod_net
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: ledgerflow_prod_worker
+    restart: always
+    user: "node"
+    command: ["node", "dist/worker/index.js"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ledgerflow}
+      REDIS_URL: redis://redis:6379
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?WEBHOOK_SECRET is required in production}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN is required in production}
+      ALLOW_PRIVATE_WEBHOOK_TARGETS: "false"
+      DEMO_MODE: "false"
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ledgerflow_prod_net
+
+networks:
+  ledgerflow_prod_net:
+    driver: bridge
+
+volumes:
+  postgres_prod_data:
+  redis_prod_data:

@@ -82,28 +82,21 @@ export async function handleMerchantWebhook(
 
     const payloadString = JSON.stringify(req.body);
 
-    // 1. Verify HMAC-SHA256 signature
-    let verification = verifySignature(
+    // 1. Verify HMAC-SHA256 signature against default secret and registered endpoints
+    const epResults = await query(
+      `SELECT secret FROM webhook_endpoints WHERE status = 'ACTIVE'`
+    ).catch(() => ({ rows: [] }));
+    const candidateSecrets = [
+      env.WEBHOOK_SECRET,
+      ...epResults.rows.map((ep: any) => ep.secret).filter(Boolean),
+    ];
+
+    const verification = verifySignature(
       payloadString,
       signatureHeader,
-      env.WEBHOOK_SECRET
+      candidateSecrets,
+      300
     );
-
-    // If signature doesn't match default WEBHOOK_SECRET, check registered endpoints
-    if (!verification.valid) {
-      try {
-        const epResults = await query(
-          `SELECT secret FROM webhook_endpoints WHERE status = 'ACTIVE'`
-        );
-        for (const ep of epResults.rows) {
-          const v = verifySignature(payloadString, signatureHeader, ep.secret);
-          if (v.valid) {
-            verification = v;
-            break;
-          }
-        }
-      } catch {}
-    }
 
     if (!verification.valid) {
       res.status(401).json({

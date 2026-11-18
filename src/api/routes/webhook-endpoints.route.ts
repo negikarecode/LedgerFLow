@@ -7,42 +7,42 @@ import {
   rotateWebhookEndpointSecret,
 } from '../controllers/webhook-endpoints.controller';
 import { requireApiKey } from '../middlewares/auth.middleware';
+import { tenantRateLimiter, expensiveRateLimiter } from '../middlewares/rate-limit.middleware';
 import { validateBody, validateParams } from '../middlewares/validate.middleware';
 import { idParamSchema } from '../schemas/common.schema';
 import { createWebhookEndpointSchema } from '../schemas/webhook-endpoint.schema';
 
 export const webhookEndpointsRouter = Router();
 
+webhookEndpointsRouter.use('/webhook-endpoints', requireApiKey, tenantRateLimiter);
+
 webhookEndpointsRouter.post(
   '/webhook-endpoints',
-  requireApiKey,
+  expensiveRateLimiter,
   validateBody(createWebhookEndpointSchema),
   createWebhookEndpoint
 );
 
 webhookEndpointsRouter.get(
   '/webhook-endpoints',
-  requireApiKey,
   listWebhookEndpoints
 );
 
 webhookEndpointsRouter.get(
   '/webhook-endpoints/:id',
-  requireApiKey,
   validateParams(idParamSchema),
   getWebhookEndpoint
 );
 
 webhookEndpointsRouter.delete(
   '/webhook-endpoints/:id',
-  requireApiKey,
   validateParams(idParamSchema),
   deleteWebhookEndpoint
 );
 
 webhookEndpointsRouter.post(
   '/webhook-endpoints/:id/rotate-secret',
-  requireApiKey,
+  expensiveRateLimiter,
   validateParams(idParamSchema),
   rotateWebhookEndpointSecret
 );

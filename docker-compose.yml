@@ -8,7 +8,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-ledgerflow}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      # Explicitly bind to 127.0.0.1 to avoid public exposure
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./src/db/migrations:/docker-entrypoint-initdb.d:ro
@@ -24,7 +25,8 @@ services:
     container_name: ledgerflow_redis
     restart: unless-stopped
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      # Explicitly bind to 127.0.0.1 to avoid public exposure
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -36,6 +38,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: development
     container_name: ledgerflow_api
     restart: unless-stopped
     environment:
@@ -49,11 +52,17 @@ services:
       DEMO_MODE: ${DEMO_MODE:-true}
       METRICS_TOKEN: ${METRICS_TOKEN:-}
     ports:
-      - "${PORT:-3000}:3000"
+      - "127.0.0.1:${PORT:-3000}:3000"
     volumes:
       - ./src:/app/src
       - ./public:/app/public
       - /app/node_modules
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/health/live', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,6 +73,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: development
     container_name: ledgerflow_worker
     restart: unless-stopped
     command: ["npm", "run", "worker:dev"]
@@ -90,7 +100,7 @@ services:
     container_name: ledgerflow_prometheus
     restart: unless-stopped
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -107,7 +117,7 @@ services:
     container_name: ledgerflow_grafana
     restart: unless-stopped
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}

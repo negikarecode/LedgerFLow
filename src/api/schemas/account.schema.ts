@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { uuidSchema } from './common.schema';
+import { MAX_SAFE_PAISE } from './transfer.schema';
 
 export const createAccountSchema = z.object({
   owner_name: z
@@ -14,10 +15,17 @@ export const createAccountSchema = z.object({
     .regex(/^[A-Z]{3}$/, { message: 'currency must be a 3-letter ISO currency code (e.g., INR, USD)' })
     .default('INR'),
   initial_credit_paise: z
-    .coerce
-    .number()
+    .number({
+      invalid_type_error: 'initial_credit_paise must be a valid number',
+    })
     .int({ message: 'initial_credit_paise must be an integer' })
     .nonnegative({ message: 'initial_credit_paise must be greater than or equal to 0' })
+    .max(MAX_SAFE_PAISE, {
+      message: `initial_credit_paise must not exceed ${MAX_SAFE_PAISE}`,
+    })
+    .refine((val) => Number.isSafeInteger(val), {
+      message: 'initial_credit_paise must be a safe JavaScript integer',
+    })
     .default(0),
 });
 

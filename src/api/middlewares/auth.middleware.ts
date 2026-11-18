@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { query } from '../../db/pool';
 import { env } from '../../config/env';
 import { hashApiKey, verifyApiKeyHash } from '../utils/api-key';
+import { authFailureTracker, getClientIp } from './rate-limit.middleware';
 
 declare global {
   namespace Express {
@@ -19,16 +20,31 @@ declare global {
 /**
  * Express middleware to authenticate merchant API keys via `Authorization: Bearer <key>`.
  * Validates prefix, verifies SHA-256 hash in constant time, verifies non-revocation,
- * and updates last_used_at asynchronously.
+ * updates last_used_at asynchronously, and protects against brute-force attacks via authFailureTracker.
  */
 export async function requireApiKey(
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
+  const clientIp = getClientIp(req);
+
+  // Check if IP is currently blocked by brute-force auth failure rate limiter
+  const { blocked, resetSeconds } = await authFailureTracker.isBlocked(clientIp);
+  if (blocked) {
+    res.setHeader('Retry-After', resetSeconds);
+    res.status(429).json({
+      error: 'Too Many Requests',
+      message: `Too many failed authentication attempts. Please retry after ${resetSeconds} seconds.`,
+      retry_after_seconds: resetSeconds,
+    });
+    return;
+  }
+
   const authHeader = req.header('authorization') || (req.headers['authorization'] as string);
 
   if (!authHeader || typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) {
+    await authFailureTracker.recordFailure(clientIp);
     res.status(401).json({
       error: 'Unauthorized',
       message: 'Missing or invalid Authorization header. Expected Bearer <api_key>',
@@ -38,7 +54,9 @@ export async function requireApiKey(
 
   const rawKey = authHeader.slice(7).trim();
 
-  if (!rawKey.startsWith('lf_live_')) {
+  // Strict format check: must start with lf_live_ followed by 20 to 128 url-safe characters
+  if (!/^lf_live_[A-Za-z0-9_-]{20,128}$/.test(rawKey)) {
+    await authFailureTracker.recordFailure(clientIp);
     res.status(401).json({
       error: 'Unauthorized',
       message: 'Invalid API key format. Expected lf_live_<token>',
@@ -50,9 +68,9 @@ export async function requireApiKey(
   const candidateHash = hashApiKey(rawKey);
 
   try {
-    // Look up non-revoked candidate keys by prefix
+    // Look up candidate keys by prefix
     const result = await query(
-      `SELECT k.id, k.merchant_id, k.key_hash, k.revoked_at, m.name as merchant_name
+      `SELECT k.id, k.merchant_id, k.key_hash, k.revoked_at, k.expires_at, m.name as merchant_name
        FROM api_keys k
        JOIN merchants m ON m.id = k.merchant_id
        WHERE k.key_prefix = $1`,
@@ -60,6 +78,7 @@ export async function requireApiKey(
     );
 
     if (result.rows.length === 0) {
+      await authFailureTracker.recordFailure(clientIp);
       res.status(401).json({
         error: 'Unauthorized',
         message: 'Invalid or revoked API key',
@@ -77,6 +96,7 @@ export async function requireApiKey(
     }
 
     if (!matchedRow) {
+      await authFailureTracker.recordFailure(clientIp);
       res.status(401).json({
         error: 'Unauthorized',
         message: 'Invalid or revoked API key',
@@ -85,9 +105,19 @@ export async function requireApiKey(
     }
 
     if (matchedRow.revoked_at != null) {
+      await authFailureTracker.recordFailure(clientIp);
       res.status(401).json({
         error: 'Unauthorized',
         message: 'API key has been revoked',
+      });
+      return;
+    }
+
+    if (matchedRow.expires_at != null && new Date(matchedRow.expires_at).getTime() <= Date.now()) {
+      await authFailureTracker.recordFailure(clientIp);
+      res.status(401).json({
+        error: 'Unauthorized',
+        message: 'API key has expired',
       });
       return;
     }
@@ -112,15 +142,31 @@ export async function requireApiKey(
 
 /**
  * Express middleware to authenticate administrative bootstrap operations via ADMIN_TOKEN.
+ * Also protected against brute-force attacks via authFailureTracker.
  */
-export function requireAdminToken(
+export async function requireAdminToken(
   req: Request,
   res: Response,
   next: NextFunction
-): void {
+): Promise<void> {
+  const clientIp = getClientIp(req);
+
+  // Check if IP is currently blocked by brute-force auth failure rate limiter
+  const { blocked, resetSeconds } = await authFailureTracker.isBlocked(clientIp);
+  if (blocked) {
+    res.setHeader('Retry-After', resetSeconds);
+    res.status(429).json({
+      error: 'Too Many Requests',
+      message: `Too many failed authentication attempts. Please retry after ${resetSeconds} seconds.`,
+      retry_after_seconds: resetSeconds,
+    });
+    return;
+  }
+
   const authHeader = req.header('authorization') || (req.headers['authorization'] as string);
 
   if (!authHeader || typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) {
+    await authFailureTracker.recordFailure(clientIp);
     res.status(401).json({
       error: 'Unauthorized',
       message: 'Missing or invalid Authorization header. Expected Bearer <admin_token>',
@@ -137,6 +183,7 @@ export function requireAdminToken(
     const expectedBuf = Buffer.from(expectedToken);
 
     if (tokenBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(tokenBuf, expectedBuf)) {
+      await authFailureTracker.recordFailure(clientIp);
       res.status(401).json({
         error: 'Unauthorized',
         message: 'Invalid admin authorization token',
@@ -146,6 +193,7 @@ export function requireAdminToken(
 
     next();
   } catch {
+    await authFailureTracker.recordFailure(clientIp);
     res.status(401).json({
       error: 'Unauthorized',
       message: 'Invalid admin authorization token',

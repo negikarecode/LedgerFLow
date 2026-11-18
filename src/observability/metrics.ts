@@ -73,6 +73,25 @@ export const webhookDeliveriesTotal = new Counter({
 });
 
 /**
+ * 6a. Rate Limit Exceeded Counter
+ */
+export const rateLimitExceededTotal = new Counter({
+  name: 'rate_limit_exceeded_total',
+  help: 'Total number of HTTP requests rejected due to rate limit exhaustion',
+  labelNames: ['tier', 'key_type'],
+  registers: [metricsRegistry],
+});
+
+/**
+ * 6b. Rate Limit Redis Fallback Counter
+ */
+export const rateLimitFallbackTotal = new Counter({
+  name: 'rate_limit_fallback_total',
+  help: 'Total number of rate limit evaluations falling back to in-memory store due to Redis unavailability',
+  registers: [metricsRegistry],
+});
+
+/**
  * 7. Circuit Breaker State Gauge (0 = CLOSED, 1 = HALF_OPEN, 2 = OPEN)
  */
 export const circuitBreakerStateGauge = new Gauge({
@@ -99,6 +118,43 @@ export const dbPoolConnections = new Gauge({
 export const ledgerConservationDiscrepancyPaise = new Gauge({
   name: 'ledger_conservation_discrepancy_paise',
   help: 'Double-entry ledger balance conservation discrepancy in paise (0 = verified healthy)',
+  registers: [metricsRegistry],
+});
+
+/**
+ * 10. Redis Connection Status Gauge (1 = connected/ready, 0 = disconnected/down)
+ */
+export const redisConnectedGauge = new Gauge({
+  name: 'redis_connected',
+  help: 'Redis connection status (1 = connected/ready, 0 = disconnected/down)',
+  registers: [metricsRegistry],
+});
+
+/**
+ * 11. Redis Errors Total Counter
+ */
+export const redisErrorsTotal = new Counter({
+  name: 'redis_errors_total',
+  help: 'Total number of Redis errors observed',
+  labelNames: ['operation'],
+  registers: [metricsRegistry],
+});
+
+/**
+ * 12. Idempotency Fallback Counter
+ */
+export const idempotencyFallbackTotal = new Counter({
+  name: 'idempotency_fallback_total',
+  help: 'Total number of times idempotency fell back to PostgreSQL due to Redis unavailability',
+  registers: [metricsRegistry],
+});
+
+/**
+ * 13. Outbox Poller Errors Total Counter
+ */
+export const outboxPollerErrorsTotal = new Counter({
+  name: 'outbox_poller_errors_total',
+  help: 'Total number of errors encountered during outbox polling cycles',
   registers: [metricsRegistry],
 });
 
@@ -217,9 +273,9 @@ export async function updateSystemMetrics(): Promise<void> {
           ) s ON a.id = s.account_id
           WHERE a.balance_paise != COALESCE(s.computed, 0)
         ), 0)
-      )::BIGINT AS discrepancy_paise
+      )::NUMERIC AS discrepancy_paise
     `);
-    const discrepancy = Number(auditRes.rows[0]?.discrepancy_paise || 0);
+    const discrepancy = Number(BigInt(auditRes.rows[0]?.discrepancy_paise || 0));
     ledgerConservationDiscrepancyPaise.set(discrepancy);
   } catch {}
 }

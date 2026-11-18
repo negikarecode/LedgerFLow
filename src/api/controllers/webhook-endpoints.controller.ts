@@ -5,8 +5,22 @@ import { query } from '../../db/pool';
 import { validateWebhookUrl, SSRFError } from '../../security/ssrf';
 import { circuitBreaker } from '../../worker/circuit-breaker';
 import { rateLimiter } from '../../worker/rate-limiter';
+import { env } from '../../config/env';
 
 const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
+
+function getEffectiveMerchantId(req: Request, res: Response): string | null {
+  const isProduction = env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production';
+  const merchantId = req.merchant?.id || (!isProduction ? DEFAULT_DEMO_MERCHANT_ID : null);
+  if (!merchantId) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Merchant authentication required',
+    });
+    return null;
+  }
+  return merchantId;
+}
 
 /**
  * Generates a high-entropy endpoint secret conforming to Stripe style (`whsec_<hex>`).
@@ -34,7 +48,8 @@ export async function createWebhookEndpoint(
   next: NextFunction
 ): Promise<void> {
   const { url, event_types = ['transfer.completed'] } = req.body;
-  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+  const merchantId = getEffectiveMerchantId(req, res);
+  if (!merchantId) return;
 
   try {
     // SSRF Validation at registration time
@@ -89,7 +104,8 @@ export async function listWebhookEndpoints(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+  const merchantId = getEffectiveMerchantId(req, res);
+  if (!merchantId) return;
 
   try {
     const result = await query(
@@ -138,7 +154,8 @@ export async function getWebhookEndpoint(
   next: NextFunction
 ): Promise<void> {
   const { id } = req.params;
-  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+  const merchantId = getEffectiveMerchantId(req, res);
+  if (!merchantId) return;
 
   try {
     const result = await query(
@@ -190,7 +207,8 @@ export async function deleteWebhookEndpoint(
   next: NextFunction
 ): Promise<void> {
   const { id } = req.params;
-  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+  const merchantId = getEffectiveMerchantId(req, res);
+  if (!merchantId) return;
 
   try {
     const result = await query(
@@ -228,7 +246,8 @@ export async function rotateWebhookEndpointSecret(
   next: NextFunction
 ): Promise<void> {
   const { id } = req.params;
-  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+  const merchantId = getEffectiveMerchantId(req, res);
+  if (!merchantId) return;
 
   try {
     const existing = await query(

@@ -6,6 +6,7 @@ services:
     plan: starter
     buildCommand: npm ci && npm run build && npm run migrate
     startCommand: npm run start
+    healthCheckPath: /health/ready
     envVars:
       - key: NODE_ENV
         value: production

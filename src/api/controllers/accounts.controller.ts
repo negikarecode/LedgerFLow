@@ -1,8 +1,22 @@
 import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { getClient, query } from '../../db/pool';
+import { env } from '../../config/env';
 
 const DEFAULT_DEMO_MERCHANT_ID = '00000000-0000-0000-0000-000000000001';
+
+function getEffectiveMerchantId(req: Request, res: Response): string | null {
+  const isProduction = env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production';
+  const merchantId = req.merchant?.id || (!isProduction ? DEFAULT_DEMO_MERCHANT_ID : null);
+  if (!merchantId) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Merchant authentication required',
+    });
+    return null;
+  }
+  return merchantId;
+}
 
 export async function createAccount(
   req: Request,
@@ -10,7 +24,8 @@ export async function createAccount(
   next: NextFunction
 ): Promise<void> {
   const { owner_name, currency, initial_credit_paise } = req.body;
-  const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+  const merchantId = getEffectiveMerchantId(req, res);
+  if (!merchantId) return;
   const client = await getClient();
 
   try {
@@ -75,7 +90,8 @@ export async function listAccounts(
   next: NextFunction
 ): Promise<void> {
   try {
-    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+    const merchantId = getEffectiveMerchantId(req, res);
+    if (!merchantId) return;
     const limit = Number(req.query.limit) || 50;
     const offset = Number(req.query.offset) || 0;
 
@@ -125,7 +141,8 @@ export async function getAccountById(
 ): Promise<void> {
   try {
     const { id } = req.params;
-    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+    const merchantId = getEffectiveMerchantId(req, res);
+    if (!merchantId) return;
 
     const accountQuery = `
       SELECT 
@@ -186,7 +203,8 @@ export async function getAccountLedger(
 ): Promise<void> {
   try {
     const { id } = req.params;
-    const merchantId = req.merchant?.id || DEFAULT_DEMO_MERCHANT_ID;
+    const merchantId = getEffectiveMerchantId(req, res);
+    if (!merchantId) return;
 
     const accountQuery = `
       SELECT id, merchant_id, owner_name, currency, balance_paise, created_at 
@@ -220,9 +238,11 @@ export async function getAccountLedger(
         : null;
 
     if (balancePaise === null || isNaN(balancePaise)) {
-      balancePaise = entriesResult.rows.reduce((sum, e) => {
-        return sum + (e.entry_type === 'CREDIT' ? Number(e.amount) : -Number(e.amount));
-      }, 0);
+      const computedBigInt = entriesResult.rows.reduce((sum: bigint, e: any) => {
+        const amt = BigInt(e.amount);
+        return e.entry_type === 'CREDIT' ? sum + amt : sum - amt;
+      }, 0n);
+      balancePaise = Number(computedBigInt);
     }
 
     res.status(200).json({
